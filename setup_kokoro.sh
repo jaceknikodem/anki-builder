@@ -18,21 +18,23 @@ VOICES_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-
 # ── venv ──────────────────────────────────────────────────────────────────────
 if [ ! -d ".venv" ]; then
   echo "Creating virtual environment..."
-  python3 -m venv .venv
+  uv venv
 fi
-
-PIP=".venv/bin/pip"
 
 # ── base deps (Gemini + Anki) ─────────────────────────────────────────────────
 echo "Installing base dependencies..."
-"$PIP" install -q -r requirements.txt
+uv pip install -q -r requirements.txt
 
 # ── audio deps ────────────────────────────────────────────────────────────────
 echo "Installing audio dependencies..."
-"$PIP" install -q \
+uv pip install -q \
   "kokoro-onnx>=0.5.0" \
   "soundfile>=0.14.0" \
   "misaki[ja]>=0.7.4"
+
+# ── unidic dictionary ─────────────────────────────────────────────────────────
+echo "Downloading UniDic dictionary (required for Japanese G2P)..."
+.venv/bin/python -m unidic download
 
 # ── model files ───────────────────────────────────────────────────────────────
 mkdir -p "$CACHE_DIR"

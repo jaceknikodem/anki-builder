@@ -9,7 +9,7 @@ Front: sentence with the target word highlighted  + audio
 Back:  English translation of the sentence  +  word meaning
 
 Setup:
-    pip install -r requirements.txt        # Gemini + Anki
+    uv pip install -r requirements.txt     # Gemini + Anki
     bash setup_kokoro.sh                   # audio (optional)
 
 Usage:
@@ -281,7 +281,7 @@ def generate_audio(text: str, language: str) -> bytes:
     lang = language.lower()
 
     if lang == "japanese" and _ja_g2p is not None:
-        ipa = _ja_g2p(text)
+        ipa, _ = _ja_g2p(text)
         audio, sr = kokoro.create(ipa, voice=voice, is_phonemes=True)
     else:
         espeak_lang = LANG_TO_ESPEAK.get(lang, "en-us")
@@ -424,8 +424,8 @@ def main() -> None:
                         help="Learner proficiency level (recommended)")
     parser.add_argument("--topic",
                         help="Topic context for sentence generation")
-    parser.add_argument("--sentences", type=int, default=2, choices=[2, 3],
-                        help="Sentences per word (default: 2)")
+    parser.add_argument("--sentence-count", type=int, default=2, choices=range(1, 6),
+                        help="Sentences per word, 1–5 (default: 2)")
     parser.add_argument("--deck-name", metavar="NAME",
                         help="Anki deck name (default: Kotoba::<Language>[::<Topic>])")
     parser.add_argument("--output", metavar="FILE",
@@ -472,7 +472,7 @@ def main() -> None:
         print(f"Proficiency: {args.proficiency.upper()}")
     if args.topic:
         print(f"Topic      : {args.topic}")
-    print(f"Sentences  : {args.sentences} per word")
+    print(f"Sentences  : {args.sentence_count} per word")
     print(f"Deck       : {deck_name}")
     print(f"Audio      : {'off' if args.no_audio else 'kokoro-onnx'}")
     print(f"Output     : {output_path}")
@@ -490,12 +490,12 @@ def main() -> None:
                 language=args.language,
                 proficiency=args.proficiency,
                 topic=args.topic,
-                sentence_count=args.sentences,
+                sentence_count=args.sentence_count,
                 client=client,
             )
             sentences = [
                 {"sentence": s.sentence, "translation": s.translation, "audio_bytes": None}
-                for s in data.sentences[: args.sentences]
+                for s in data.sentences[: args.sentence_count]
             ]
             words_data.append({
                 "word": word,
