@@ -66,6 +66,7 @@ _sf = None           # soundfile module
 _Kokoro = None       # kokoro_onnx.Kokoro class
 _kokoro = None       # loaded Kokoro instance
 _ja_g2p = None       # misaki Japanese G2P (optional)
+_ja_tagger = None    # fugashi MeCab tagger (optional, Japanese furigana)
 
 CACHE_DIR  = Path.home() / ".cache" / "kotoba-ai"
 MODEL_PATH = CACHE_DIR / "kokoro-v1.0.int8.onnx"
@@ -305,6 +306,58 @@ def highlight_word(sentence: str, word: str) -> str:
     return escaped
 
 
+# ── Furigana (Japanese only) ───────────────────────────────────────────────────
+
+def _get_ja_tagger():
+    global _ja_tagger
+    if _ja_tagger is None:
+        try:
+            import fugashi
+            _ja_tagger = fugashi.Tagger()
+        except Exception:
+            _ja_tagger = False  # disable gracefully
+    return _ja_tagger if _ja_tagger else None
+
+
+def _kata_to_hira(s: str) -> str:
+    return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ン" else c for c in s)
+
+
+def _has_kanji(s: str) -> bool:
+    return any("一" <= c <= "鿿" or "㐀" <= c <= "䶿" for c in s)
+
+
+def furigana_highlight_html(sentence: str, word: str) -> str:
+    """Return sentence as HTML with ruby furigana; the target word is highlighted."""
+    tagger = _get_ja_tagger()
+    if tagger is None:
+        return highlight_word(sentence, word)
+
+    morphemes = list(tagger(sentence))
+    surface_text = "".join(m.surface for m in morphemes)
+    word_start = surface_text.find(word)
+    word_end = word_start + len(word) if word_start != -1 else -1
+
+    parts: list[str] = []
+    pos = 0
+    for m in morphemes:
+        surface = m.surface
+        m_end = pos + len(surface)
+        in_word = word_start != -1 and pos >= word_start and m_end <= word_end
+
+        kana = getattr(m.feature, "kana", None)
+        if _has_kanji(surface) and kana and kana != "*" and kana != surface:
+            reading = _kata_to_hira(kana)
+            inner = f"<ruby>{html.escape(surface)}<rt>{html.escape(reading)}</rt></ruby>"
+        else:
+            inner = html.escape(surface)
+
+        parts.append(f'<span class="kw">{inner}</span>' if in_word else inner)
+        pos = m_end
+
+    return "".join(parts)
+
+
 # ── Anki model ─────────────────────────────────────────────────────────────────
 
 _MODEL_CSS = """\
@@ -320,6 +373,8 @@ _MODEL_CSS = """\
 .translation { margin-top: 12px; color: #444; }
 .word { color: #888; font-size: 16px; margin-top: 14px; font-style: italic; }
 hr#answer { margin: 18px 0; border: none; border-top: 1px solid #e0e0e0; }
+ruby { ruby-align: center; }
+rt { font-size: 0.5em; color: #555; }
 """
 
 SENTENCE_MODEL = genanki.Model(
@@ -356,6 +411,7 @@ def build_apkg(
     words_data: list[dict],
     deck_name: str,
     output_path: str,
+    language: str = "",
 ) -> int:
     """
     Each entry in words_data:
@@ -384,10 +440,15 @@ def build_apkg(
                     media_paths.append(tmp_path)
                     audio_field = f"[sound:{filename}]"
 
+                sentence_html = (
+                    furigana_highlight_html(sent["sentence"], word)
+                    if language.lower() == "japanese"
+                    else highlight_word(sent["sentence"], word)
+                )
                 note = genanki.Note(
                     model=SENTENCE_MODEL,
                     fields=[
-                        highlight_word(sent["sentence"], word),
+                        sentence_html,
                         html.escape(sent["translation"]),
                         audio_field,
                         html.escape(f"{word} — {word_translation}"),
@@ -531,7 +592,7 @@ def main() -> None:
 
     # ── Step 3: Package ───────────────────────────────────────────────────────
     print(f"\n── Writing {output_path} ──────────────────────────────────────────")
-    card_count = build_apkg(words_data, deck_name, output_path)
+    card_count = build_apkg(words_data, deck_name, output_path, language=args.language)
     print(f"Done — {card_count} cards → {output_path}")
 
 
