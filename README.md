@@ -26,28 +26,30 @@ This installs `kokoro-onnx` and downloads the model files (~120 MB) to `~/.cache
 export GEMINI_API_KEY="..."
 
 # Basic
-python anki_export.py \
+uv run python anki_export.py \
     --words "comprare,vendere,mangiare" \
     --language italian --proficiency a2
 
 # With topic and custom deck name
-python anki_export.py \
+uv run python anki_export.py \
     --words-file words.txt \
     --language japanese --proficiency b1 \
     --topic travel \
     --deck-name "Japanese B1 — Travel"
 
 # 3 sentences per word, no audio
-python anki_export.py \
+uv run python anki_export.py \
     --words "hola,gracias,por favor" \
     --language spanish --proficiency newbie \
     --sentences 3 --no-audio
 
 # Custom output path
-python anki_export.py \
+uv run python anki_export.py \
     --words "bonjour,merci" --language french \
     --output ~/Desktop/french.apkg
 ```
+
+> `uv run` ensures the project's virtualenv is used. Alternatively, activate it first with `source .venv/bin/activate` and use `python` directly.
 
 ## Flags
 

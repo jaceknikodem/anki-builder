@@ -38,7 +38,9 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -48,17 +50,17 @@ try:
     from google import genai
     from google.genai import types as genai_types
 except ImportError:
-    sys.exit("Missing dep: pip install google-genai")
+    sys.exit("Missing dep: uv pip install google-genai")
 
 try:
     from pydantic import BaseModel
 except ImportError:
-    sys.exit("Missing dep: pip install pydantic")
+    sys.exit("Missing dep: uv pip install pydantic")
 
 try:
     import genanki
 except ImportError:
-    sys.exit("Missing dep: pip install genanki")
+    sys.exit("Missing dep: uv pip install genanki")
 
 # ── audio deps — only imported when audio is enabled (see _load_audio_deps) ───
 
@@ -66,6 +68,7 @@ _sf = None           # soundfile module
 _Kokoro = None       # kokoro_onnx.Kokoro class
 _kokoro = None       # loaded Kokoro instance
 _ja_g2p = None       # misaki Japanese G2P (optional)
+_ja_g2p_lock = threading.Lock()  # misaki is not documented thread-safe
 _ja_tagger = None    # fugashi MeCab tagger (optional, Japanese furigana)
 
 CACHE_DIR  = Path.home() / ".cache" / "kotoba-ai"
@@ -282,7 +285,8 @@ def generate_audio(text: str, language: str) -> bytes:
     lang = language.lower()
 
     if lang == "japanese" and _ja_g2p is not None:
-        ipa, _ = _ja_g2p(text)
+        with _ja_g2p_lock:
+            ipa, _ = _ja_g2p(text)
         audio, sr = kokoro.create(ipa, voice=voice, is_phonemes=True)
     else:
         espeak_lang = LANG_TO_ESPEAK.get(lang, "en-us")
@@ -578,11 +582,25 @@ def main() -> None:
         print(f"\n── Audio skipped ───────────────────────────────────────────────")
     else:
         print(f"\n── Generating audio ({total} sentences via kokoro-onnx) ─────────")
+        _get_kokoro()  # load model once before spawning threads
+
+        # Flatten to (sent_dict, text, language) triples so threads can work independently
+        all_sents = [
+            sent
+            for word_info in words_data
+            for sent in word_info["sentences"]
+        ]
+
         ok = 0
-        for word_info in words_data:
-            for sent in word_info["sentences"]:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(generate_audio, sent["sentence"], args.language): sent
+                for sent in all_sents
+            }
+            for future in as_completed(futures):
+                sent = futures[future]
                 try:
-                    sent["audio_bytes"] = generate_audio(sent["sentence"], args.language)
+                    sent["audio_bytes"] = future.result()
                     ok += 1
                     print(".", end="", flush=True)
                 except Exception as exc:
