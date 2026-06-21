@@ -46,71 +46,31 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
-# ── required deps ──────────────────────────────────────────────────────────────
+import fugashi
+import genanki
+import soundfile as sf
+from google import genai
+from google.genai import types as genai_types
+from kokoro_onnx import Kokoro
+from misaki import ja as misaki_ja
+from pydantic import BaseModel
 
-try:
-    from google import genai
-    from google.genai import types as genai_types
-except ImportError:
-    sys.exit("Missing dep: uv pip install google-genai")
-
-try:
-    from pydantic import BaseModel
-except ImportError:
-    sys.exit("Missing dep: uv pip install pydantic")
-
-try:
-    import genanki
-except ImportError:
-    sys.exit("Missing dep: uv pip install genanki")
-
-# ── audio deps — only imported when audio is enabled (see _load_audio_deps) ───
-
-_sf = None           # soundfile module
-_Kokoro = None       # kokoro_onnx.Kokoro class
-_kokoro = None       # loaded Kokoro instance
-_ja_g2p = None       # misaki Japanese G2P (optional)
+_ja_g2p = None       # misaki Japanese G2P instance
 _ja_g2p_lock = threading.Lock()  # misaki is not documented thread-safe
-_ja_tagger = None    # fugashi MeCab tagger (optional, Japanese furigana)
+_ja_tagger = None    # fugashi MeCab tagger (Japanese furigana)
 
 CACHE_DIR  = Path.home() / ".cache" / "kotoba-ai"
 MODEL_PATH = CACHE_DIR / "kokoro-v1.0.int8.onnx"
 VOICES_PATH = CACHE_DIR / "voices-v1.0.bin"
 
+_kokoro = Kokoro(str(MODEL_PATH), str(VOICES_PATH))
+
 
 def _load_audio_deps() -> None:
-    """Import audio libraries and verify model files exist. Exits on failure."""
-    global _sf, _Kokoro, _ja_g2p
-
-    missing = []
-    if not MODEL_PATH.exists():
-        missing.append(f"model file: {MODEL_PATH}")
-    if not VOICES_PATH.exists():
-        missing.append(f"voices file: {VOICES_PATH}")
-    if missing:
-        print("Kokoro model files not found:", file=sys.stderr)
-        for m in missing:
-            print(f"  {m}", file=sys.stderr)
-        print("Run:  bash setup_kokoro.sh", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        import soundfile as sf
-        _sf = sf
-    except ImportError:
-        sys.exit("Missing audio dep: run  bash setup_kokoro.sh")
-
-    try:
-        from kokoro_onnx import Kokoro
-        _Kokoro = Kokoro
-    except ImportError:
-        sys.exit("Missing audio dep: run  bash setup_kokoro.sh")
-
-    try:
-        from misaki import ja as misaki_ja
-        _ja_g2p = misaki_ja.JAG2P()
-    except ImportError:
-        pass  # Japanese phonemization degrades gracefully
+    """Initialize Japanese language processing deps."""
+    global _ja_g2p, _ja_tagger
+    _ja_g2p = misaki_ja.JAG2P()
+    _ja_tagger = fugashi.Tagger()
 
 
 # ── language / voice config ────────────────────────────────────────────────────
@@ -140,46 +100,258 @@ LANG_TO_ESPEAK: dict[str, str] = {
 
 GRAMMAR_GUIDANCE: dict[str, dict[str, str]] = {
     "italian": {
-        "newbie": "presente (essere/avere/regular), simple S-V patterns, fixed chunks (posso/devo/voglio)",
-        "a1":     "presente all persons, passato prossimo recognition, modal + infinitive, imperatives",
-        "a2":     "productive passato prossimo, imperfetto/futuro recognition, gerundio progressivo",
-        "b1":     "productive imperfetto, full condizionale, congiuntivo recognition, clitics",
+        "newbie": (
+            "USE: presente of essere/avere/stare + regular -are/-ere verbs in 1st–3rd sg only; "
+            "fixed modal chunks (posso/devo/voglio/ho bisogno di + infinitive). "
+            "AVOID: passato prossimo, imperfetto, futuro, object pronouns, subordinate clauses, "
+            "irregular verbs beyond essere/avere/stare/fare. "
+            "STRUCTURE: bare S-V or S-V-O only; concrete high-frequency vocabulary; ≤8 words per sentence."
+        ),
+        "a1": (
+            "USE: presente all 6 persons including key irregulars (fare/andare/dire/venire/sapere/uscire); "
+            "modal + infinitive productively; tu/Lei imperative; basic reflexive verbs (mi chiamo/mi sveglio/mi alzo); "
+            "definite and indefinite articles; negation non; connectors e/ma/però/perché/quando. "
+            "AVOID: passato prossimo in productive output (recognition only), clitics, congiuntivo, "
+            "relative clauses with cui. "
+            "STRUCTURE: simple S-V-O with one optional adjunct; ≤12 words per sentence."
+        ),
+        "a2": (
+            "USE: passato prossimo productively (essere vs. avere auxiliary, past participle agreement); "
+            "stare + gerundio (sto leggendo); reflexive verbs fully; ne/ci as locative/partitive; "
+            "direct object pronouns (lo/la/li/le); adverbs of frequency (sempre/mai/spesso/ancora/già); "
+            "relative clauses with che. "
+            "AVOID: congiuntivo, combined clitics (glielo), passive voice, imperfetto in productive output. "
+            "STRUCTURE: may include one simple relative clause or temporal clause; 8–14 words per sentence."
+        ),
+        "b1": (
+            "USE: imperfetto productively for habitual past and background description; "
+            "futuro semplice; condizionale presente (vorrei/potrei/dovrei/sarei); "
+            "congiuntivo presente in formulaic triggers (penso/credo/spero/voglio che + subj); "
+            "direct + indirect clitics productively; si passivante; "
+            "connectors (quindi/però/tuttavia/nonostante/sebbene). "
+            "AVOID: congiuntivo imperfetto, congiuntivo trapassato, periodo ipotetico III type. "
+            "STRUCTURE: one subordinate clause allowed; idiomatic expressions welcome; 10–18 words per sentence."
+        ),
     },
     "spanish": {
-        "newbie": "presente (ser/estar/tener + regular), simple S-V patterns",
-        "a1":     "presente all persons, basic reflexives, modal + infinitive, periphrastic future",
-        "a2":     "pretérito perfecto compuesto, estar+gerundio, basic condicional, gustar verbs",
-        "b1":     "present subjunctive, advanced connectors, conversational idioms",
+        "newbie": (
+            "USE: presente of ser/estar/tener + regular -ar/-er/-ir verbs (yo/tú/él forms only); "
+            "gender-agreeing adjectives; negation no; basic interrogatives (¿qué?/¿dónde?/¿cómo?); "
+            "fixed phrases (me llamo…/tengo…años). "
+            "AVOID: preterite, reflexives, object pronouns, stem-changing verbs, ser vs. estar nuance. "
+            "STRUCTURE: S-V or S-V-O only; concrete everyday vocabulary; ≤8 words per sentence."
+        ),
+        "a1": (
+            "USE: presente all 6 persons including stem-changers (e→ie/o→ue/e→i) and irregulars "
+            "(ser/estar/ir/tener/venir/hacer/saber/poder); reflexive verbs (levantarse/llamarse); "
+            "modal periphrasis (querer/poder/deber + inf); periphrastic future (ir a + inf); "
+            "direct object pronouns (lo/la/los/las); basic connectors (y/pero/porque/cuando). "
+            "AVOID: preterite, imperfecto, subjunctive, indirect object clitic clusters. "
+            "STRUCTURE: simple S-V-O with one optional adverbial; ≤12 words per sentence."
+        ),
+        "a2": (
+            "USE: pretérito perfecto compuesto (he/has/ha… + participio) for recent actions; "
+            "pretérito indefinido for completed past events; estar + gerundio productively; "
+            "gustar-type verbs (encantar/doler/parecer/interesar) with indirect object pronouns; "
+            "basic condicional (me gustaría/podría/debería); demonstratives; comparatives (más…que/tan…como); "
+            "por vs. para in high-frequency patterns. "
+            "AVOID: present subjunctive, imperfecto, pluscuamperfecto. "
+            "STRUCTURE: may include one relative clause (que) or causal clause; 8–14 words per sentence."
+        ),
+        "b1": (
+            "USE: present subjunctive in common triggers (querer que/es importante que/cuando+future action); "
+            "pretérito imperfecto vs. indefinido contrast; pluscuamperfecto for recognition; "
+            "complex connectors (aunque/sin embargo/a pesar de/por lo tanto/mientras que); "
+            "ser vs. estar nuanced distinctions; long-range clitic placement; "
+            "idiomatic expressions and colloquial register where natural. "
+            "AVOID: imperfect subjunctive, conditional perfect, vosotros unless targeting Spain specifically. "
+            "STRUCTURE: one subordinate clause; 10–18 words per sentence."
+        ),
     },
     "portuguese": {
-        "newbie": "presente (ser/estar/ter/regular), simple S-V patterns",
-        "a1":     "presente all persons, pretérito perfeito recognition, poder/precisar + infinitive",
-        "a2":     "pretérito perfeito, estar+gerúndio, basic condicional (gostaria/poderia)",
-        "b1":     "pretérito imperfeito, futuro do presente, full condicional, subjuntivo recognition",
+        "newbie": (
+            "USE: presente of ser/estar/ter/ficar + regular -ar/-er/-ir verbs (eu/você/ele forms); "
+            "gender-agreeing adjectives; negation não; basic interrogatives (o que/onde/como); "
+            "fixed phrases (me chamo…/tenho…anos). "
+            "AVOID: preterite, reflexives, object pronouns, irregular verbs beyond ser/estar/ter. "
+            "STRUCTURE: S-V or S-V-O; concrete vocabulary; ≤8 words per sentence. "
+            "Note: default to Brazilian Portuguese (você, a gente) unless European specified."
+        ),
+        "a1": (
+            "USE: presente all persons including irregulars (ir/vir/fazer/saber/poder/querer); "
+            "poder/precisar/querer + infinitive; reflexive pronouns (me/se); "
+            "definite and indefinite articles; negation não; connectors e/mas/porque/quando; "
+            "pretérito perfeito for recognition only (vi/fui/fiz). "
+            "AVOID: pretérito perfeito in productive output, imperfeito, futuro, object clitic clusters. "
+            "STRUCTURE: S-V-O with one optional adjunct; ≤12 words per sentence."
+        ),
+        "a2": (
+            "USE: pretérito perfeito productively (regular and key irregular: fui/vi/fiz/vim/trouxe); "
+            "estar + gerúndio (estou comendo — Brazilian) or a + infinitive (European); "
+            "direct object pronouns; condicional de cortesia (gostaria/poderia/precisaria); "
+            "quantifiers and comparatives; relative clauses with que. "
+            "AVOID: pretérito imperfeito in productive output, subjunctive, personal infinitive. "
+            "STRUCTURE: may include one relative or causal clause; 8–14 words per sentence."
+        ),
+        "b1": (
+            "USE: pretérito imperfeito productively (habitual/background past, descriptions); "
+            "futuro do presente (falarei/irá — or ir a + inf colloquially); "
+            "full condicional; presente do subjuntivo in formulaic triggers (quero que/é importante que); "
+            "personal infinitive; complex connectors (embora/apesar de/portanto/enquanto). "
+            "AVOID: futuro do subjuntivo (except in set phrases), imperfeito do subjuntivo. "
+            "STRUCTURE: one subordinate clause allowed; idiomatic expressions welcome; 10–18 words per sentence."
+        ),
     },
     "japanese": {
-        "newbie": "copula (です/ではありません), simple polite verb forms, basic particles (は・が・を・に)",
-        "a1":     "polite past (〜ました), te-form recognition, あります/います",
-        "a2":     "te-form usage, plain forms, potential (〜られる/〜できる), basic conditionals (〜たら)",
-        "b1":     "full plain-form conjugation, extended te-forms (〜てしまう), passive/causative",
+        "newbie": (
+            "USE: copula (です/ではありません/じゃありません); present-tense polite verb forms (~ます/~ません) "
+            "for common verbs (たべます/のみます/いきます/きます/します); "
+            "particles は・が・を・に・で・も; demonstratives (これ/それ/あれ/ここ/そこ). "
+            "AVOID: て-form, た-form, plain/dictionary form, conditionals, relative clauses, keigo. "
+            "STRUCTURE: topic-comment or S-O-V; short, concrete, single-clause sentences; ≤10 words. "
+            "Write in kana + common kanji (JLPT N5 kanji only); add furigana on unfamiliar kanji."
+        ),
+        "a1": (
+            "USE: polite past (~ました/~ませんでした); て-form for sequential actions (〜てから) and requests (〜てください); "
+            "あります/います (existence/possession distinction); "
+            "〜たいです (want to); 〜ましょう/〜ましょうか (let's/shall we); "
+            "time expressions and frequency adverbs (毎日/よく/たまに). "
+            "AVOID: plain form in productive output, potential form, conditional, passive. "
+            "STRUCTURE: up to two linked clauses via て-form; 10–14 words. JLPT N5–N4 kanji."
+        ),
+        "a2": (
+            "USE: て-form compounds (〜ている progressive/state; 〜てみる; 〜てしまう); "
+            "plain/dictionary form productively; potential form (~られる/~できる); "
+            "conditionals (〜たら for sequenced/hypothetical); "
+            "noun modification with plain-form relative clauses; "
+            "のです/んです for explanation; ために/ように purpose clauses. "
+            "AVOID: passive, causative, keigo beyond ます/です, て-form causative. "
+            "STRUCTURE: one embedded clause; 12–18 words. JLPT N4–N3 kanji."
+        ),
+        "b1": (
+            "USE: full plain-form conjugation across tenses; passive (〜られる) and causative (〜させる); "
+            "keigo basics (〜ていただく/〜てさしあげる/〜ていただけますか); "
+            "extended predicate nominalizers (こと/の); conjunctions (〜ので/〜のに/〜ても/〜ながら); "
+            "indirect speech (〜と言っていた/〜と思う); "
+            "colloquial contractions (〜ている→〜てる; 〜てしまう→〜ちゃう). "
+            "AVOID: literary/archaic forms, overly complex keigo chains. "
+            "STRUCTURE: up to two embedded clauses; 14–22 words. JLPT N3–N2 kanji with furigana on N2."
+        ),
     },
     "polish": {
-        "newbie": "basic present tense (być/mieć), S-V-O, simple negation, noun gender",
-        "a1":     "present tense all persons, past recognition, modals (mogę/chcę/muszę), basic cases",
-        "a2":     "past tense all genders, future (będę + inf), accusative/dative in predictable patterns",
-        "b1":     "perfective/imperfective, conditional forms, instrumental/genitive, subordinate clauses",
+        "newbie": (
+            "USE: present tense być/mieć/chcieć + regular verbs (1st/2nd/3rd sg); "
+            "nominative and accusative cases for common masculine/feminine/neuter nouns; "
+            "basic adjective agreement (nominative only); negation nie; "
+            "simple S-V-O; common adverbs (tu/tam/teraz/bardzo). "
+            "AVOID: past tense, genitive, instrumental, dative, reflexives, aspect distinction. "
+            "STRUCTURE: S-V or S-V-O; concrete everyday vocabulary; ≤8 words per sentence."
+        ),
+        "a1": (
+            "USE: present tense all persons for all verb classes; "
+            "past tense for recognition (był/była/było/byli); "
+            "modals (mogę/chcę/muszę/powinienem + inf); "
+            "accusative case productively; basic genitive (negation/possession); "
+            "question words (kto/co/gdzie/kiedy/jak/dlaczego); connectors i/ale/bo/że/kiedy. "
+            "AVOID: instrumental/locative/dative in productive output, perfective aspect distinction, "
+            "conditional, passive. "
+            "STRUCTURE: S-V-O with one optional adverbial; ≤12 words per sentence."
+        ),
+        "a2": (
+            "USE: past tense productively all genders/persons; "
+            "future with będę + infinitive (imperfective); "
+            "accusative and genitive in predictable patterns (negation, quantity, prepositions: do/z/bez/od/dla); "
+            "dative with common verbs (dać/powiedzieć/pomóc); "
+            "reflexive się productively; locative with w/na for place; "
+            "aspect pairs in high-frequency verbs. "
+            "AVOID: instrumental beyond fixed phrases, complex subordinate clauses, conditional. "
+            "STRUCTURE: may include one subordinate clause (że/kiedy/żeby); 8–14 words per sentence."
+        ),
+        "b1": (
+            "USE: perfective/imperfective aspect contrast productively across tenses; "
+            "conditional (chciałbym/mogłabym); "
+            "instrumental productively (z kimś/być kimś/czymś); "
+            "genitive plural; verbal nouns; subordinate clauses (żeby/chociaż/mimo że/dopóki); "
+            "passive constructions with być + past participle. "
+            "AVOID: archaic or highly formal constructions, rare case collocations. "
+            "STRUCTURE: one complex subordinate clause; idiomatic expressions welcome; 10–18 words per sentence."
+        ),
     },
     "french": {
-        "newbie": "présent (être/avoir/aller/regular -er), S-V-O, basic negation (ne…pas)",
-        "a1":     "présent all persons, passé composé recognition, modal + inf (pouvoir/vouloir/devoir)",
-        "a2":     "productive passé composé, imparfait recognition, futur proche, pronoms COD",
-        "b1":     "imparfait vs passé composé, futur simple, conditionnel, subjonctif recognition",
+        "newbie": (
+            "USE: présent of être/avoir/aller + regular -er verbs (je/tu/il forms); "
+            "basic articles (le/la/les/un/une/des); negation ne…pas; "
+            "basic interrogatives (qu'est-ce que/où/comment/qui); "
+            "fixed expressions (je m'appelle/j'ai…ans/il y a). "
+            "AVOID: passé composé, imparfait, reflexives, object pronouns, liaisons explained explicitly. "
+            "STRUCTURE: S-V or S-V-O; concrete high-frequency vocabulary; ≤8 words per sentence."
+        ),
+        "a1": (
+            "USE: présent all persons including key irregulars (faire/pouvoir/vouloir/devoir/venir/savoir/prendre); "
+            "modal + infinitive productively; reflexive verbs (se lever/se coucher/s'appeler); "
+            "passé composé with avoir/être for recognition; "
+            "basic adjective agreement (position and gender); "
+            "connectors et/mais/parce que/quand/alors. "
+            "AVOID: imparfait, futur simple, subjunctive, object pronouns in productive output. "
+            "STRUCTURE: S-V-O with one optional adverbial; ≤12 words per sentence."
+        ),
+        "a2": (
+            "USE: passé composé productively (avoir vs être auxiliary, past participle agreement with être verbs); "
+            "imparfait for recognition/comprehension framing; futur proche (aller + inf) productively; "
+            "direct object pronouns (le/la/les/me/te) in correct pre-verb position; "
+            "comparatives (plus/moins/aussi…que); "
+            "depuis + présent for ongoing states; relative clauses with qui/que. "
+            "AVOID: futur simple, conditionnel, subjunctive, combined pronoun clusters. "
+            "STRUCTURE: may include one relative clause or causal clause; 8–14 words per sentence."
+        ),
+        "b1": (
+            "USE: imparfait vs passé composé contrast productively; "
+            "futur simple productively; conditionnel présent (je voudrais/je pourrais/il faudrait); "
+            "subjonctif présent in formulaic triggers (il faut que/je veux que/bien que + subj); "
+            "indirect object and adverbial pronouns (y/en) productively; "
+            "plus-que-parfait for recognition; connectors (cependant/néanmoins/pourtant/donc/afin de). "
+            "AVOID: subjonctif passé, conditionnel passé, passive with faire causatif. "
+            "STRUCTURE: one subordinate clause; idiomatic register welcome; 10–18 words per sentence."
+        ),
     },
     "indonesian": {
-        "newbie": "simple S-V-O, basic stative adjectives, negation (tidak/bukan), common pronouns",
-        "a1":     "me-/ber- prefixes, question words, possessives -nya, reduplication",
-        "a2":     "di- passives, modals (bisa/harus/mau), aspect markers (sedang/sudah/belum/akan)",
-        "b1":     "varied affix combinations, full passive system, complex clauses (kalau/meskipun)",
+        "newbie": (
+            "USE: base (bare) verb forms; simple S-V-O; "
+            "common pronouns (saya/aku/kamu/dia/kami/kita/mereka); "
+            "stative adjectives as predicates; negation tidak (verbs/adjectives) vs bukan (nouns); "
+            "topic-fronting; common nouns without affixes. "
+            "AVOID: me-/ber-/di- affixes, reduplication, formal register, aspect markers. "
+            "STRUCTURE: bare S-V or S-V-O; concrete everyday vocabulary; ≤8 words per sentence."
+        ),
+        "a1": (
+            "USE: me- prefix verbs (makan/minum/pergi base; membeli/membaca/menulis affixed); "
+            "ber- verbs (berbicara/bekerja/berjalan); "
+            "question words (apa/siapa/di mana/kapan/bagaimana/mengapa/berapa); "
+            "possessive suffix -nya; simple reduplication (noun plurals: buku-buku); "
+            "connectors dan/atau/tapi/karena/kalau. "
+            "AVOID: di- passive, ke-…-an/-an nominalizations, complex affix stacking. "
+            "STRUCTURE: S-V-O with one optional adjunct; ≤12 words per sentence."
+        ),
+        "a2": (
+            "USE: di- passive productively (buku itu dibeli oleh dia); "
+            "modals (bisa/harus/mau/boleh/perlu + base verb); "
+            "aspect markers (sedang for progressive; sudah for completion; belum for not-yet; akan for future); "
+            "me-…-kan and me-…-i causative/directional verbs; "
+            "ke-…-an and pe-…-an nominalizations in common words; "
+            "relative clauses with yang. "
+            "AVOID: complex affix stacking (memper-…-kan), formal register vocabulary. "
+            "STRUCTURE: may include one relative clause (yang) or conditional; 8–14 words per sentence."
+        ),
+        "b1": (
+            "USE: varied affix combinations (memper-…-kan; ke-…-an; pe-N-…-an) in productive output; "
+            "full passive system (di- and ter- for accidental/involuntary); "
+            "complex subordinating conjunctions (walaupun/meskipun/sehingga/agar/supaya/padahal/setelah); "
+            "formal vs. colloquial register contrast (saya vs. aku; tidak vs. nggak; "
+            "mengapa vs. kenapa); "
+            "idiomatic expressions and proverbs. "
+            "AVOID: archaic or highly literary forms (adapun/barang siapa). "
+            "STRUCTURE: one complex subordinate clause; 10–18 words per sentence."
+        ),
     },
 }
 
@@ -271,31 +443,21 @@ def fetch_word_data(
 
 # ── Kokoro TTS (direct, no HTTP) ───────────────────────────────────────────────
 
-def _get_kokoro():
-    global _kokoro
-    if _kokoro is None:
-        print("  Loading Kokoro model...", flush=True)
-        _kokoro = _Kokoro(str(MODEL_PATH), str(VOICES_PATH))
-        print("  Kokoro ready", flush=True)
-    return _kokoro
-
-
 def generate_audio(text: str, language: str) -> bytes:
     """Synthesise WAV audio and return raw bytes."""
     voice = _voice(language)
-    kokoro = _get_kokoro()
     lang = language.lower()
 
     if lang == "japanese" and _ja_g2p is not None:
         with _ja_g2p_lock:
             ipa, _ = _ja_g2p(text)
-        audio, sr = kokoro.create(ipa, voice=voice, is_phonemes=True)
+        audio, sr = _kokoro.create(ipa, voice=voice, is_phonemes=True)
     else:
         espeak_lang = LANG_TO_ESPEAK.get(lang, "en-us")
-        audio, sr = kokoro.create(text, voice=voice, lang=espeak_lang)
+        audio, sr = _kokoro.create(text, voice=voice, lang=espeak_lang)
 
     buf = io.BytesIO()
-    _sf.write(buf, audio, sr, format="WAV")
+    sf.write(buf, audio, sr, format="WAV")
     return buf.getvalue()
 
 
@@ -314,17 +476,6 @@ def highlight_word(sentence: str, word: str) -> str:
 
 # ── Furigana (Japanese only) ───────────────────────────────────────────────────
 
-def _get_ja_tagger():
-    global _ja_tagger
-    if _ja_tagger is None:
-        try:
-            import fugashi
-            _ja_tagger = fugashi.Tagger()
-        except Exception:
-            _ja_tagger = False  # disable gracefully
-    return _ja_tagger if _ja_tagger else None
-
-
 def _kata_to_hira(s: str) -> str:
     return "".join(chr(ord(c) - 0x60) if "ァ" <= c <= "ン" else c for c in s)
 
@@ -335,7 +486,7 @@ def _has_kanji(s: str) -> bool:
 
 def furigana_highlight_html(sentence: str, word: str) -> str:
     """Return sentence as HTML with ruby furigana; the target word is highlighted."""
-    tagger = _get_ja_tagger()
+    tagger = _ja_tagger
     if tagger is None:
         return highlight_word(sentence, word)
 
@@ -366,7 +517,7 @@ def furigana_highlight_html(sentence: str, word: str) -> str:
 
 def sentence_to_hiragana(sentence: str) -> str:
     """Return a flat hiragana transcription of a Japanese sentence using fugashi readings."""
-    tagger = _get_ja_tagger()
+    tagger = _ja_tagger
     if tagger is None:
         return _kata_to_hira(sentence)
     parts: list[str] = []
@@ -710,17 +861,15 @@ def build_apkg(
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def main() -> None:
+def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Generate Anki flashcards from a word list (Gemini + Kokoro TTS)",
     )
-
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--words", metavar="WORD,WORD,...",
                      help="Comma-separated list of words")
     src.add_argument("--words-file", metavar="FILE",
                      help="One word per line")
-
     parser.add_argument("--language", required=True,
                         help="Target language, e.g. spanish, japanese, italian")
     parser.add_argument("--proficiency", choices=["newbie", "a1", "a2", "b1"],
@@ -739,21 +888,19 @@ def main() -> None:
                         help="Skip audio generation; text-only cards")
     parser.add_argument("--pronunciation-cards", action="store_true",
                         help="Generate pronunciation cards instead of reading cards")
+    return parser
 
-    args = parser.parse_args()
 
-    # ── API key ──────────────────────────────────────────────────────────────
+def _init(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[genai.Client, list[str], str, str]:
     api_key = args.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
     if not api_key:
         parser.error("Gemini API key required: --gemini-api-key or GEMINI_API_KEY env var")
 
     client = genai.Client(api_key=api_key)
 
-    # ── Audio deps (lazy) ─────────────────────────────────────────────────────
     if not args.no_audio:
         _load_audio_deps()
 
-    # ── Word list ─────────────────────────────────────────────────────────────
     if args.words:
         words = [w.strip() for w in args.words.split(",") if w.strip()]
     else:
@@ -763,14 +910,16 @@ def main() -> None:
     if not words:
         parser.error("No words found")
 
-    # ── Names ─────────────────────────────────────────────────────────────────
     deck_name = args.deck_name or (
         f"Kotoba::{args.language.capitalize()}"
         + (f"::{args.topic.capitalize()}" if args.topic else "")
     )
     output_path = args.output or f"{args.language}_anki.apkg"
 
-    # ── Banner ────────────────────────────────────────────────────────────────
+    return client, words, deck_name, output_path
+
+
+def _print_params(args: argparse.Namespace, words: list[str], deck_name: str, output_path: str) -> None:
     print(f"Language   : {args.language}")
     print(f"Words      : {len(words)}  ({', '.join(words[:6])}{'...' if len(words) > 6 else ''})")
     if args.proficiency:
@@ -784,7 +933,8 @@ def main() -> None:
     print(f"Output     : {output_path}")
     print()
 
-    # ── Step 1: Sentences ─────────────────────────────────────────────────────
+
+def _generate_sentences(args: argparse.Namespace, words: list[str], client: genai.Client) -> list[dict]:
     print("── Generating sentences ────────────────────────────────────────")
     words_data: list[dict] = []
 
@@ -816,40 +966,45 @@ def main() -> None:
     if not words_data:
         sys.exit("No words processed.")
 
-    # ── Step 2: Audio ─────────────────────────────────────────────────────────
+    return words_data
+
+
+def _generate_audio(words_data: list[dict], language: str) -> None:
     total = sum(len(w["sentences"]) for w in words_data)
+    print(f"\n── Generating audio ({total} sentences via kokoro-onnx) ─────────")
+
+    all_sents = [sent for word_info in words_data for sent in word_info["sentences"]]
+    ok = 0
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = {
+            pool.submit(generate_audio, sent["sentence"], language): sent
+            for sent in all_sents
+        }
+        for future in as_completed(futures):
+            sent = futures[future]
+            try:
+                sent["audio_bytes"] = future.result()
+                ok += 1
+                print(".", end="", flush=True)
+            except Exception as exc:
+                print(f"\n  Warning: audio failed for '{sent['sentence'][:40]}': {exc}",
+                      file=sys.stderr)
+    print(f"\n  {ok}/{total} audio files generated")
+
+
+def main() -> None:
+    parser = _build_parser()
+    args = parser.parse_args()
+
+    client, words, deck_name, output_path = _init(args, parser)
+    _print_params(args, words, deck_name, output_path)
+    words_data = _generate_sentences(args, words, client)
 
     if args.no_audio:
-        print(f"\n── Audio skipped ───────────────────────────────────────────────")
+        print("── Audio skipped ───────────────────────────────────────────────")
     else:
-        print(f"\n── Generating audio ({total} sentences via kokoro-onnx) ─────────")
-        _get_kokoro()  # load model once before spawning threads
+        _generate_audio(words_data, args.language)
 
-        # Flatten to (sent_dict, text, language) triples so threads can work independently
-        all_sents = [
-            sent
-            for word_info in words_data
-            for sent in word_info["sentences"]
-        ]
-
-        ok = 0
-        with ThreadPoolExecutor(max_workers=4) as pool:
-            futures = {
-                pool.submit(generate_audio, sent["sentence"], args.language): sent
-                for sent in all_sents
-            }
-            for future in as_completed(futures):
-                sent = futures[future]
-                try:
-                    sent["audio_bytes"] = future.result()
-                    ok += 1
-                    print(".", end="", flush=True)
-                except Exception as exc:
-                    print(f"\n  Warning: audio failed for '{sent['sentence'][:40]}': {exc}",
-                          file=sys.stderr)
-        print(f"\n  {ok}/{total} audio files generated")
-
-    # ── Step 3: Package ───────────────────────────────────────────────────────
     print(f"\n── Writing {output_path} ──────────────────────────────────────────")
     card_count = build_apkg(
         words_data, deck_name, output_path,
