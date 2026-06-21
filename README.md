@@ -57,7 +57,7 @@ uv run python anki_export.py \
 |------|-------------|
 | `--words WORD,WORD,...` | Comma-separated word list |
 | `--words-file FILE` | One word per line |
-| `--language` | Target language (spanish, japanese, italian, french, portuguese, polish, indonesian, english) |
+| `--language` | Target language (japanese, spanish, french, italian, portuguese, chinese) |
 | `--proficiency` | `newbie` / `a1` / `a2` / `b1` — shapes grammar complexity in sentences |
 | `--topic` | Topic context for sentence generation (e.g. food, travel, work) |
 | `--sentences` | `2` or `3` sentences per word (default: 2) |
@@ -71,13 +71,11 @@ uv run python anki_export.py \
 | Language | Voice |
 |----------|-------|
 | Japanese | jf_alpha, jf_gongitsune, jf_nezumi, jf_tebukuro, jm_kumo |
-| English | af_heart, af_bella, af_nicole, am_fenrir, am_michael |
 | Spanish | ef_dora |
 | French | ff_siwis |
 | Italian | if_sara |
 | Portuguese | pf_dora |
 | Chinese | zf_xiaobei, zf_xiaoni, zm_yunxi |
-| Korean | kf_aria, km_junho |
 
 ## Dependencies
 
