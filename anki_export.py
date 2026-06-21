@@ -364,6 +364,18 @@ def furigana_highlight_html(sentence: str, word: str) -> str:
     return "".join(parts)
 
 
+def sentence_to_hiragana(sentence: str) -> str:
+    """Return a flat hiragana transcription of a Japanese sentence using fugashi readings."""
+    tagger = _get_ja_tagger()
+    if tagger is None:
+        return _kata_to_hira(sentence)
+    parts: list[str] = []
+    for m in tagger(sentence):
+        kana = getattr(m.feature, "kana", None)
+        parts.append(_kata_to_hira(kana) if kana and kana != "*" else m.surface)
+    return "".join(parts)
+
+
 # ── Anki model ─────────────────────────────────────────────────────────────────
 
 _MODEL_CSS = """\
@@ -381,28 +393,58 @@ _MODEL_CSS = """\
 hr#answer { margin: 18px 0; border: none; border-top: 1px solid #e0e0e0; }
 ruby { ruby-align: center; }
 rt { font-size: 0.5em; color: #555; }
+.kotoba-replay {
+  background: none; border: 1.5px solid #2563eb; border-radius: 50%;
+  color: #2563eb; cursor: pointer; font-size: 16px;
+  width: 34px; height: 34px; margin-top: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.kotoba-replay:hover { background: #eff6ff; }
 """
 
-# SentencesJSON field holds a JSON array: [{s: <html>, t: <plain text>, a: <filename|"">}, ...]
+# SentencesJSON field: [{s:<html>, t:<plain>, a:<filename|"">, qi:<audio-queue-idx>?}, ...]
+# Audios field:        [sound:f1.wav][sound:f2.wav]... — processed by Anki for native audio.
 # JS picks one entry randomly on the front, stores the index in sessionStorage, and
-# the back reads the same index so the translation matches the shown sentence.
+# intercepts Anki's pycmd auto-play to redirect it to the selected sentence's audio.
+# pycmd is set up asynchronously (QWebChannel), so we poll until it's available.
+
+_AUDIO_JS = """\
+  var _qi = items[idx].qi;
+  if (_qi !== undefined) {
+    var _fired = false, _n = 0;
+    (function poll() {
+      if (typeof pycmd !== 'function') { if (++_n < 100) setTimeout(poll, 20); return; }
+      var orig = pycmd;
+      window._kotobaReplay = function () { orig('play:q:' + _qi); };
+      pycmd = function (cmd) {
+        if (/^play:q:\\d+$/.test(cmd)) {
+          if (!_fired) { _fired = true; orig('play:q:' + _qi); }
+          return;
+        }
+        orig(cmd);
+      };
+    }());
+  }"""
 
 _FRONT_TMPL = """\
 <script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
 <div id="kotoba-sentence" class="sentence"></div>
+<button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
+<span style="display:none">{{Audios}}</span>
 <script>
 (function () {
   var items = JSON.parse(document.getElementById('kotoba-data').textContent);
   var idx = Math.floor(Math.random() * items.length);
   sessionStorage.setItem('kotobaIdx', String(idx));
   document.getElementById('kotoba-sentence').innerHTML = items[idx].s;
-  if (items[idx].a) { try { (new Audio(items[idx].a)).play(); } catch (e) {} }
+""" + _AUDIO_JS + """
 }());
 </script>"""
 
 _BACK_TMPL = """\
 <script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
 <div id="kotoba-sentence" class="sentence"></div>
+<button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
 <hr id=answer>
 <div id="kotoba-translation" class="translation"></div>
 {{#Word}}<div class="word">{{Word}}</div>{{/Word}}
@@ -413,18 +455,176 @@ _BACK_TMPL = """\
   if (idx < 0 || idx >= items.length) idx = 0;
   document.getElementById('kotoba-sentence').innerHTML = items[idx].s;
   document.getElementById('kotoba-translation').textContent = items[idx].t;
+  var qi = items[idx].qi;
+  if (qi !== undefined) {
+    window._kotobaReplay = function () { if (typeof pycmd === 'function') pycmd('play:q:' + qi); };
+  }
 }());
 </script>"""
 
 SENTENCE_MODEL = genanki.Model(
-    1758600000004,
+    1758600000006,
     "Kotoba Sentence v2",
     fields=[
         {"name": "SentencesJSON"},  # JSON array of sentence objects
+        {"name": "Audios"},         # [sound:f1.wav][sound:f2.wav]... for native Anki audio
         {"name": "Word"},           # "word — meaning"
     ],
     templates=[{"name": "Card 1", "qfmt": _FRONT_TMPL, "afmt": _BACK_TMPL}],
     css=_MODEL_CSS,
+)
+
+# ── Pronunciation card model ────────────────────────────────────────────────────
+# SentencesJSON items carry two extra fields used only by this template:
+#   p — plain sentence text (no HTML), for scoring against kanji input
+#   h — flat hiragana transcription, for scoring against kana input (Japanese only)
+
+_PRON_CSS = _MODEL_CSS + """\
+#typeans { display: none !important; }
+.pron-label { color: #888; font-size: 14px; margin-bottom: 4px; }
+.score-box { font-size: 52px; font-weight: 700; margin: 14px 0 4px; }
+.score-excellent { color: #16a34a; }
+.score-ok        { color: #d97706; }
+.score-poor      { color: #dc2626; }
+.score-verdict   { font-size: 17px; color: #555; margin-bottom: 10px; }
+.you-said        { font-size: 15px; color: #777; margin: 6px 0 14px; }
+.you-said em     { color: #1c1c1e; font-style: normal; }
+"""
+
+# Pronunciation cards use {{type:SentencePlain}} solely for iOS keyboard/mic input.
+# Anki's own comparison display (#typeans) is hidden; we extract the typed text from
+# it on the back and run our own Levenshtein scoring against both kanji and hiragana.
+# Each pronunciation note always uses sentence index 0 (fixed target for {{type:}}).
+
+_PRON_FRONT_TMPL = """\
+<script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
+<div class="pron-label">Listen, then show answer to speak:</div>
+<div id="kotoba-sentence" class="sentence"></div>
+<button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
+<span style="display:none">{{Audios}}</span>
+{{type:SentencePlain}}
+<script>
+(function () {
+  var items = JSON.parse(document.getElementById('kotoba-data').textContent);
+  document.getElementById('kotoba-sentence').innerHTML = items[0].s;
+""" + _AUDIO_JS.replace("items[idx]", "items[0]") + """
+}());
+</script>"""
+
+_PRON_BACK_TMPL = """\
+<script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
+<div id="kotoba-sentence" class="sentence"></div>
+<button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
+<hr id=answer>
+<div id="score-box" class="score-box"></div>
+<div id="score-verdict" class="score-verdict"></div>
+<div id="you-said" class="you-said"></div>
+<div id="kotoba-translation" class="translation"></div>
+{{#Word}}<div class="word">{{Word}}</div>{{/Word}}
+<script>
+(function () {
+  function lev(a, b) {
+    var m = a.length, n = b.length, i, j;
+    var dp = [];
+    for (i = 0; i <= m; i++) { dp[i] = [i]; }
+    for (j = 1; j <= n; j++) { dp[0][j] = j; }
+    for (i = 1; i <= m; i++) {
+      for (j = 1; j <= n; j++) {
+        dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1]
+          : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+      }
+    }
+    return dp[m][n];
+  }
+  function sim(a, b) {
+    if (!a && !b) return 1;
+    if (!a || !b) return 0;
+    return 1 - lev(a, b) / Math.max(a.length, b.length);
+  }
+  function norm(s) {
+    return s.trim().replace(/[\\u30A1-\\u30F6]/g, function (c) {
+      return String.fromCharCode(c.charCodeAt(0) - 0x60);
+    });
+  }
+  function esc(s) {
+    return s.replace(/[<>&"]/g, function (c) {
+      return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];
+    });
+  }
+  var item = JSON.parse(document.getElementById('kotoba-data').textContent)[0];
+  document.getElementById('kotoba-sentence').innerHTML = item.s;
+  document.getElementById('kotoba-translation').textContent = item.t;
+  if (item.qi !== undefined) {
+    window._kotobaReplay = function () { if (typeof pycmd === 'function') pycmd('play:q:' + item.qi); };
+  }
+  function extractTyped() {
+    var typeans = document.getElementById('typeans');
+    if (!typeans) return '';
+    // Anki marks user's chars as typeGood (correct) or typeBad (wrong); typeMissed = not typed.
+    var spans = typeans.querySelectorAll('.typeGood, .typeBad');
+    if (spans.length > 0) {
+      var t = ''; spans.forEach(function (el) { t += el.textContent; }); return t;
+    }
+    // Fallback: full text minus missed chars (different Anki versions).
+    var clone = typeans.cloneNode(true);
+    clone.querySelectorAll('.typeMissed').forEach(function (el) { el.remove(); });
+    return clone.textContent.trim();
+  }
+  function showScore() {
+    var userRaw  = extractTyped();
+    var userNorm = norm(userRaw);
+    var score = Math.max(
+      sim(userNorm, norm(item.p || '')),
+      item.h ? sim(userNorm, norm(item.h)) : 0
+    );
+    var pct = Math.round(score * 100);
+    var box     = document.getElementById('score-box');
+    var verdict = document.getElementById('score-verdict');
+    box.textContent = pct + '%';
+    if (pct >= 85) {
+      box.className = 'score-box score-excellent';
+      verdict.textContent = 'Excellent!';
+    } else if (pct >= 60) {
+      box.className = 'score-box score-ok';
+      verdict.textContent = 'Almost there';
+    } else {
+      box.className = 'score-box score-poor';
+      verdict.textContent = 'Keep practising';
+    }
+    document.getElementById('you-said').innerHTML =
+      userRaw ? 'You said: <em>' + esc(userRaw) + '</em>' : '<em>(nothing recorded)</em>';
+  }
+  // #typeans is populated asynchronously by Anki after the template renders.
+  var typeans = document.getElementById('typeans');
+  if (typeans && typeans.children.length > 0) {
+    showScore();
+  } else {
+    new MutationObserver(function (mutations, obs) {
+      var ta = document.getElementById('typeans');
+      if (ta && (ta.children.length > 0 || ta.textContent.trim())) {
+        obs.disconnect();
+        showScore();
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+  // Fallback: if observer never fires (e.g. user typed nothing), show after 1.5 s.
+  setTimeout(function () {
+    if (!document.getElementById('score-box').textContent) showScore();
+  }, 1500);
+}());
+</script>"""
+
+PRONUNCIATION_MODEL = genanki.Model(
+    1758600000008,
+    "Kotoba Pronunciation v2",
+    fields=[
+        {"name": "SentencesJSON"},
+        {"name": "Audios"},
+        {"name": "SentencePlain"},  # plain text of sentence 0, target for {{type:}}
+        {"name": "Word"},
+    ],
+    templates=[{"name": "Pronunciation", "qfmt": _PRON_FRONT_TMPL, "afmt": _PRON_BACK_TMPL}],
+    css=_PRON_CSS,
 )
 
 
@@ -439,16 +639,18 @@ def build_apkg(
     deck_name: str,
     output_path: str,
     language: str = "",
+    pronunciation_cards: bool = False,
 ) -> int:
     """
     Each entry in words_data:
         {word, word_translation, sentences: [{sentence, translation, audio_bytes?}]}
-    One card per word; the card template picks a sentence randomly at review time.
+    pronunciation_cards=True → only pronunciation cards (no reading cards).
     Returns card count.
     """
     deck = genanki.Deck(_deck_id(deck_name), deck_name)
     tmp_dir = tempfile.mkdtemp(prefix="kotoba-anki-")
     media_paths: list[str] = []
+    is_japanese = language.lower() == "japanese"
 
     try:
         shuffled = list(words_data)
@@ -459,6 +661,7 @@ def build_apkg(
             word_translation = word_info["word_translation"]
 
             items: list[dict] = []
+            audio_queue: list[str] = []  # filenames in order, for the Audios field
             for sent in word_info["sentences"]:
                 audio_filename = ""
                 audio_bytes: Optional[bytes] = sent.get("audio_bytes")
@@ -473,23 +676,42 @@ def build_apkg(
 
                 sentence_html = (
                     furigana_highlight_html(sent["sentence"], word)
-                    if language.lower() == "japanese"
+                    if is_japanese
                     else highlight_word(sent["sentence"], word)
                 )
-                items.append({"s": sentence_html, "t": sent["translation"], "a": audio_filename})
+                item: dict = {
+                    "s": sentence_html,
+                    "t": sent["translation"],
+                    "a": audio_filename,
+                    "p": sent["sentence"],  # plain text for pronunciation scoring
+                }
+                if audio_filename:
+                    item["qi"] = len(audio_queue)  # index in Anki's sound queue
+                    audio_queue.append(audio_filename)
+                if is_japanese:
+                    item["h"] = sentence_to_hiragana(sent["sentence"])
+                items.append(item)
 
-            # Escape </script> sequences so the JSON is safe inside a <script> tag
-            sentences_json = json.dumps(items, ensure_ascii=False).replace("</", "<\\/")
+            # Unicode-escape < so the JSON is safe inside any HTML/script context.
+            # < is decoded correctly by JSON.parse(); avoids genanki HTML warnings.
+            sentences_json = json.dumps(items, ensure_ascii=False).replace("<", "\\u003c")
+            audios_field = "".join(f"[sound:{f}]" for f in audio_queue)
+            word_field = html.escape(f"{word} — {word_translation}")
 
-            note = genanki.Note(
-                model=SENTENCE_MODEL,
-                fields=[
-                    sentences_json,
-                    html.escape(f"{word} — {word_translation}"),
-                ],
-                guid=genanki.guid_for(f"kotoba-export-v2:{deck_name}:{word}"),
-            )
-            deck.add_note(note)
+            if not pronunciation_cards:
+                note = genanki.Note(
+                    model=SENTENCE_MODEL,
+                    fields=[sentences_json, audios_field, word_field],
+                    guid=genanki.guid_for(f"kotoba-export-v3:{deck_name}:{word}"),
+                )
+                deck.add_note(note)
+            else:
+                pron_note = genanki.Note(
+                    model=PRONUNCIATION_MODEL,
+                    fields=[sentences_json, audios_field, items[0]["p"], word_field],
+                    guid=genanki.guid_for(f"kotoba-pron-v3:{deck_name}:{word}"),
+                )
+                deck.add_note(pron_note)
 
         pkg = genanki.Package(deck)
         pkg.media_files = media_paths
@@ -529,6 +751,8 @@ def main() -> None:
                         help="Gemini API key (or set GEMINI_API_KEY env var)")
     parser.add_argument("--no-audio", action="store_true",
                         help="Skip audio generation; text-only cards")
+    parser.add_argument("--pronunciation-cards", action="store_true",
+                        help="Generate pronunciation cards instead of reading cards")
 
     args = parser.parse_args()
 
@@ -570,6 +794,7 @@ def main() -> None:
     print(f"Sentences  : {args.sentence_count} per word")
     print(f"Deck       : {deck_name}")
     print(f"Audio      : {'off' if args.no_audio else 'kokoro-onnx'}")
+    print(f"Cards      : {'pronunciation' if args.pronunciation_cards else 'reading'}")
     print(f"Output     : {output_path}")
     print()
 
@@ -640,7 +865,11 @@ def main() -> None:
 
     # ── Step 3: Package ───────────────────────────────────────────────────────
     print(f"\n── Writing {output_path} ──────────────────────────────────────────")
-    card_count = build_apkg(words_data, deck_name, output_path, language=args.language)
+    card_count = build_apkg(
+        words_data, deck_name, output_path,
+        language=args.language,
+        pronunciation_cards=args.pronunciation_cards,
+    )
     print(f"Done — {card_count} cards → {output_path}")
 
 
