@@ -56,25 +56,19 @@ def _load_audio_deps() -> None:
 
 VOICES: dict[str, list[str]] = {
     "japanese":   ["jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo"],
-    "english":    ["af_heart", "af_bella", "af_nicole", "am_fenrir", "am_michael"],
     "spanish":    ["ef_dora"],
     "french":     ["ff_siwis"],
     "italian":    ["if_sara"],
     "portuguese": ["pf_dora"],
     "chinese":    ["zf_xiaobei", "zf_xiaoni", "zm_yunxi"],
-    "korean":     ["kf_aria", "km_junho"],
 }
 
 LANG_TO_ESPEAK: dict[str, str] = {
-    "english":    "en-us",
     "spanish":    "es",
     "french":     "fr-fr",
     "italian":    "it",
     "portuguese": "pt-br",
     "chinese":    "cmn",
-    "korean":     "ko",
-    "polish":     "pl",
-    "indonesian": "id",
 }
 
 GRAMMAR_GUIDANCE: dict[str, dict[str, str]] = json.loads(
