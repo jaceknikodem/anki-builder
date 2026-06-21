@@ -33,6 +33,7 @@ import argparse
 import hashlib
 import html
 import io
+import json
 import os
 import random
 import re
@@ -382,26 +383,47 @@ ruby { ruby-align: center; }
 rt { font-size: 0.5em; color: #555; }
 """
 
+# SentencesJSON field holds a JSON array: [{s: <html>, t: <plain text>, a: <filename|"">}, ...]
+# JS picks one entry randomly on the front, stores the index in sessionStorage, and
+# the back reads the same index so the translation matches the shown sentence.
+
+_FRONT_TMPL = """\
+<script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
+<div id="kotoba-sentence" class="sentence"></div>
+<script>
+(function () {
+  var items = JSON.parse(document.getElementById('kotoba-data').textContent);
+  var idx = Math.floor(Math.random() * items.length);
+  sessionStorage.setItem('kotobaIdx', String(idx));
+  document.getElementById('kotoba-sentence').innerHTML = items[idx].s;
+  if (items[idx].a) { try { (new Audio(items[idx].a)).play(); } catch (e) {} }
+}());
+</script>"""
+
+_BACK_TMPL = """\
+<script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
+<div id="kotoba-sentence" class="sentence"></div>
+<hr id=answer>
+<div id="kotoba-translation" class="translation"></div>
+{{#Word}}<div class="word">{{Word}}</div>{{/Word}}
+<script>
+(function () {
+  var items = JSON.parse(document.getElementById('kotoba-data').textContent);
+  var idx = parseInt(sessionStorage.getItem('kotobaIdx') || '0', 10);
+  if (idx < 0 || idx >= items.length) idx = 0;
+  document.getElementById('kotoba-sentence').innerHTML = items[idx].s;
+  document.getElementById('kotoba-translation').textContent = items[idx].t;
+}());
+</script>"""
+
 SENTENCE_MODEL = genanki.Model(
-    1758600000003,
-    "Kotoba Sentence Export",
+    1758600000004,
+    "Kotoba Sentence v2",
     fields=[
-        {"name": "Sentence"},     # HTML, word highlighted
-        {"name": "Translation"},  # English sentence translation
-        {"name": "Audio"},        # [sound:xxx.wav]  or empty
-        {"name": "Word"},         # "word — meaning"
+        {"name": "SentencesJSON"},  # JSON array of sentence objects
+        {"name": "Word"},           # "word — meaning"
     ],
-    templates=[
-        {
-            "name": "Card 1",
-            "qfmt": '{{Audio}}<div class="sentence">{{Sentence}}</div>',
-            "afmt": (
-                "{{FrontSide}}\n<hr id=answer>\n"
-                '<div class="translation">{{Translation}}</div>'
-                '{{#Word}}<div class="word">{{Word}}</div>{{/Word}}'
-            ),
-        }
-    ],
+    templates=[{"name": "Card 1", "qfmt": _FRONT_TMPL, "afmt": _BACK_TMPL}],
     css=_MODEL_CSS,
 )
 
@@ -421,6 +443,7 @@ def build_apkg(
     """
     Each entry in words_data:
         {word, word_translation, sentences: [{sentence, translation, audio_bytes?}]}
+    One card per word; the card template picks a sentence randomly at review time.
     Returns card count.
     """
     deck = genanki.Deck(_deck_id(deck_name), deck_name)
@@ -428,42 +451,43 @@ def build_apkg(
     media_paths: list[str] = []
 
     try:
-        all_cards = [
-            (word_info, idx, sent)
-            for word_info in words_data
-            for idx, sent in enumerate(word_info["sentences"])
-        ]
-        random.shuffle(all_cards)
+        shuffled = list(words_data)
+        random.shuffle(shuffled)
 
-        for word_info, idx, sent in all_cards:
+        for word_info in shuffled:
             word = word_info["word"]
             word_translation = word_info["word_translation"]
-            audio_bytes: Optional[bytes] = sent.get("audio_bytes")
 
-            audio_field = ""
-            if audio_bytes:
-                slug = hashlib.md5(sent["sentence"].encode()).hexdigest()[:10]
-                filename = f"kotoba_{slug}.wav"
-                tmp_path = os.path.join(tmp_dir, filename)
-                with open(tmp_path, "wb") as fh:
-                    fh.write(audio_bytes)
-                media_paths.append(tmp_path)
-                audio_field = f"[sound:{filename}]"
+            items: list[dict] = []
+            for sent in word_info["sentences"]:
+                audio_filename = ""
+                audio_bytes: Optional[bytes] = sent.get("audio_bytes")
+                if audio_bytes:
+                    slug = hashlib.md5(sent["sentence"].encode()).hexdigest()[:10]
+                    filename = f"kotoba_{slug}.wav"
+                    tmp_path = os.path.join(tmp_dir, filename)
+                    with open(tmp_path, "wb") as fh:
+                        fh.write(audio_bytes)
+                    media_paths.append(tmp_path)
+                    audio_filename = filename
 
-            sentence_html = (
-                furigana_highlight_html(sent["sentence"], word)
-                if language.lower() == "japanese"
-                else highlight_word(sent["sentence"], word)
-            )
+                sentence_html = (
+                    furigana_highlight_html(sent["sentence"], word)
+                    if language.lower() == "japanese"
+                    else highlight_word(sent["sentence"], word)
+                )
+                items.append({"s": sentence_html, "t": sent["translation"], "a": audio_filename})
+
+            # Escape </script> sequences so the JSON is safe inside a <script> tag
+            sentences_json = json.dumps(items, ensure_ascii=False).replace("</", "<\\/")
+
             note = genanki.Note(
                 model=SENTENCE_MODEL,
                 fields=[
-                    sentence_html,
-                    html.escape(sent["translation"]),
-                    audio_field,
+                    sentences_json,
                     html.escape(f"{word} — {word_translation}"),
                 ],
-                guid=genanki.guid_for(f"kotoba-export:{deck_name}:{word}:{idx}"),
+                guid=genanki.guid_for(f"kotoba-export-v2:{deck_name}:{word}"),
             )
             deck.add_note(note)
 
