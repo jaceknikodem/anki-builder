@@ -394,43 +394,30 @@ hr#answer { margin: 18px 0; border: none; border-top: 1px solid #e0e0e0; }
 ruby { ruby-align: center; }
 rt { font-size: 0.5em; color: #555; }
 .kotoba-replay {
-  background: none; border: 1.5px solid #2563eb; border-radius: 50%;
-  color: #2563eb; cursor: pointer; font-size: 16px;
-  width: 34px; height: 34px; margin-top: 8px;
+  background: none; border: 2px solid #2563eb; border-radius: 50%;
+  color: #2563eb; cursor: pointer; font-size: 22px;
+  width: 52px; height: 52px; margin-top: 8px;
   display: inline-flex; align-items: center; justify-content: center;
 }
 .kotoba-replay:hover { background: #eff6ff; }
 """
 
-# SentencesJSON field: [{s:<html>, t:<plain>, a:<filename|"">, qi:<audio-queue-idx>?}, ...]
-# Audios field:        [sound:f1.wav][sound:f2.wav]... — processed by Anki for native audio.
-# JS picks one entry randomly on the front, stores the index in sessionStorage, and
-# intercepts Anki's pycmd auto-play to redirect it to the selected sentence's audio.
-# pycmd is set up asynchronously (QWebChannel), so we poll until it's available.
+# SentencesJSON field: [{s:<html>, t:<plain>, a:<filename|"">, p:<plain>, h?:<hiragana>}, ...]
+# Audios field:        [sound:f1.wav][sound:f2.wav]... — kept in field values so Anki's
+#                      media manager counts the files as used; NOT rendered in templates.
+# JS plays the selected sentence's audio directly via the HTML5 Audio API.
 
 _AUDIO_JS = """\
-  var _qi = items[idx].qi;
-  if (_qi !== undefined) {
-    var _fired = false, _n = 0;
-    (function poll() {
-      if (typeof pycmd !== 'function') { if (++_n < 100) setTimeout(poll, 20); return; }
-      var orig = pycmd;
-      window._kotobaReplay = function () { orig('play:q:' + _qi); };
-      pycmd = function (cmd) {
-        if (/^play:q:\\d+$/.test(cmd)) {
-          if (!_fired) { _fired = true; orig('play:q:' + _qi); }
-          return;
-        }
-        orig(cmd);
-      };
-    }());
+  if (items[idx].a) {
+    var _audio = new Audio(items[idx].a);
+    _audio.play();
+    window._kotobaReplay = function () { _audio.currentTime = 0; _audio.play(); };
   }"""
 
 _FRONT_TMPL = """\
 <script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
 <div id="kotoba-sentence" class="sentence"></div>
 <button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
-<span style="display:none">{{Audios}}</span>
 <script>
 (function () {
   var items = JSON.parse(document.getElementById('kotoba-data').textContent);
@@ -455,9 +442,8 @@ _BACK_TMPL = """\
   if (idx < 0 || idx >= items.length) idx = 0;
   document.getElementById('kotoba-sentence').innerHTML = items[idx].s;
   document.getElementById('kotoba-translation').textContent = items[idx].t;
-  var qi = items[idx].qi;
-  if (qi !== undefined) {
-    window._kotobaReplay = function () { if (typeof pycmd === 'function') pycmd('play:q:' + qi); };
+  if (items[idx].a) {
+    window._kotobaReplay = function () { new Audio(items[idx].a).play(); };
   }
 }());
 </script>"""
@@ -501,7 +487,6 @@ _PRON_FRONT_TMPL = """\
 <div class="pron-label">Listen, then show answer to speak:</div>
 <div id="kotoba-sentence" class="sentence"></div>
 <button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
-<span style="display:none">{{Audios}}</span>
 {{type:SentencePlain}}
 <script>
 (function () {
@@ -555,8 +540,8 @@ _PRON_BACK_TMPL = """\
   var item = JSON.parse(document.getElementById('kotoba-data').textContent)[0];
   document.getElementById('kotoba-sentence').innerHTML = item.s;
   document.getElementById('kotoba-translation').textContent = item.t;
-  if (item.qi !== undefined) {
-    window._kotobaReplay = function () { if (typeof pycmd === 'function') pycmd('play:q:' + item.qi); };
+  if (item.a) {
+    window._kotobaReplay = function () { new Audio(item.a).play(); };
   }
   function extractTyped() {
     var typeans = document.getElementById('typeans');
