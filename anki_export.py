@@ -34,6 +34,7 @@ import hashlib
 import html
 import io
 import os
+import random
 import re
 import shutil
 import sys
@@ -427,39 +428,44 @@ def build_apkg(
     media_paths: list[str] = []
 
     try:
-        for word_info in words_data:
+        all_cards = [
+            (word_info, idx, sent)
+            for word_info in words_data
+            for idx, sent in enumerate(word_info["sentences"])
+        ]
+        random.shuffle(all_cards)
+
+        for word_info, idx, sent in all_cards:
             word = word_info["word"]
             word_translation = word_info["word_translation"]
+            audio_bytes: Optional[bytes] = sent.get("audio_bytes")
 
-            for idx, sent in enumerate(word_info["sentences"]):
-                audio_bytes: Optional[bytes] = sent.get("audio_bytes")
+            audio_field = ""
+            if audio_bytes:
+                slug = hashlib.md5(sent["sentence"].encode()).hexdigest()[:10]
+                filename = f"kotoba_{slug}.wav"
+                tmp_path = os.path.join(tmp_dir, filename)
+                with open(tmp_path, "wb") as fh:
+                    fh.write(audio_bytes)
+                media_paths.append(tmp_path)
+                audio_field = f"[sound:{filename}]"
 
-                audio_field = ""
-                if audio_bytes:
-                    slug = hashlib.md5(sent["sentence"].encode()).hexdigest()[:10]
-                    filename = f"kotoba_{slug}.wav"
-                    tmp_path = os.path.join(tmp_dir, filename)
-                    with open(tmp_path, "wb") as fh:
-                        fh.write(audio_bytes)
-                    media_paths.append(tmp_path)
-                    audio_field = f"[sound:{filename}]"
-
-                sentence_html = (
-                    furigana_highlight_html(sent["sentence"], word)
-                    if language.lower() == "japanese"
-                    else highlight_word(sent["sentence"], word)
-                )
-                note = genanki.Note(
-                    model=SENTENCE_MODEL,
-                    fields=[
-                        sentence_html,
-                        html.escape(sent["translation"]),
-                        audio_field,
-                        html.escape(f"{word} — {word_translation}"),
-                    ],
-                    guid=genanki.guid_for(f"kotoba-export:{deck_name}:{word}:{idx}"),
-                )
-                deck.add_note(note)
+            sentence_html = (
+                furigana_highlight_html(sent["sentence"], word)
+                if language.lower() == "japanese"
+                else highlight_word(sent["sentence"], word)
+            )
+            note = genanki.Note(
+                model=SENTENCE_MODEL,
+                fields=[
+                    sentence_html,
+                    html.escape(sent["translation"]),
+                    audio_field,
+                    html.escape(f"{word} — {word_translation}"),
+                ],
+                guid=genanki.guid_for(f"kotoba-export:{deck_name}:{word}:{idx}"),
+            )
+            deck.add_note(note)
 
         pkg = genanki.Package(deck)
         pkg.media_files = media_paths
