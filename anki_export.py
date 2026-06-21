@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import argparse
 import hashlib
 import html
 import io
@@ -12,22 +11,28 @@ import os
 import random
 import re
 import shutil
-import sys
 import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from enum import Enum
 from pathlib import Path
 from typing import Optional
 
 import fugashi
 import genanki
 import soundfile as sf
+import typer
 from google import genai
 from google.genai import types as genai_types
 from kokoro_onnx import Kokoro
 from misaki import ja as misaki_ja
 from pydantic import BaseModel
+from rich.console import Console
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
+
+console = Console()
+err_console = Console(stderr=True)
 
 _ja_g2p = None       # misaki Japanese G2P instance
 _ja_g2p_lock = threading.Lock()  # misaki is not documented thread-safe
@@ -79,6 +84,16 @@ GRAMMAR_GUIDANCE: dict[str, dict[str, str]] = json.loads(
 
 def _voice(language: str) -> str:
     return VOICES.get(language.lower(), ["af_heart"])[0]
+
+
+class Proficiency(str, Enum):
+    newbie = "newbie"
+    a1 = "a1"
+    a2 = "a2"
+    b1 = "b1"
+
+
+app = typer.Typer()
 
 
 # ── Pydantic schemas ───────────────────────────────────────────────────────────
@@ -157,7 +172,7 @@ def fetch_word_data(
             last_err = exc
             if attempt < 2:
                 wait = (attempt + 1) * 4
-                print(f"    retry {attempt + 1}/3: {exc} (waiting {wait}s)")
+                console.print(f"    [yellow]retry {attempt + 1}/3:[/yellow] {exc} (waiting {wait}s)")
                 time.sleep(wait)
     raise last_err
 
@@ -400,158 +415,168 @@ def build_apkg(
 
 # ── CLI ────────────────────────────────────────────────────────────────────────
 
-def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        description="Generate Anki flashcards from a word list (Gemini + Kokoro TTS)",
-    )
-    src = parser.add_mutually_exclusive_group(required=True)
-    src.add_argument("--words", metavar="WORD,WORD,...",
-                     help="Comma-separated list of words")
-    src.add_argument("--words-file", metavar="FILE",
-                     help="One word per line")
-    parser.add_argument("--language", required=True,
-                        help="Target language, e.g. spanish, japanese, italian")
-    parser.add_argument("--proficiency", choices=["newbie", "a1", "a2", "b1"],
-                        help="Learner proficiency level (recommended)")
-    parser.add_argument("--topic",
-                        help="Topic context for sentence generation")
-    parser.add_argument("--sentence-count", type=int, default=2, choices=range(1, 6),
-                        help="Sentences per word, 1–5 (default: 2)")
-    parser.add_argument("--deck-name", metavar="NAME",
-                        help="Anki deck name (default: Kotoba::<Language>[::<Topic>])")
-    parser.add_argument("--output", metavar="FILE",
-                        help="Output .apkg path (default: <language>_anki.apkg)")
-    parser.add_argument("--gemini-api-key", metavar="KEY",
-                        help="Gemini API key (or set GEMINI_API_KEY env var)")
-    parser.add_argument("--no-audio", action="store_true",
-                        help="Skip audio generation; text-only cards")
-    parser.add_argument("--pronunciation-cards", action="store_true",
-                        help="Generate pronunciation cards instead of reading cards")
-    return parser
+def _print_params(
+    language: str,
+    words: list[str],
+    proficiency: Optional[Proficiency],
+    topic: Optional[str],
+    sentence_count: int,
+    deck_name: str,
+    output_path: str,
+    no_audio: bool,
+    pronunciation_cards: bool,
+) -> None:
+    console.print(f"[bold]Language[/bold]   : {language}")
+    console.print(f"[bold]Words[/bold]      : {len(words)}  ({', '.join(words[:6])}{'...' if len(words) > 6 else ''})")
+    if proficiency:
+        console.print(f"[bold]Proficiency[/bold]: {proficiency.upper()}")
+    if topic:
+        console.print(f"[bold]Topic[/bold]      : {topic}")
+    console.print(f"[bold]Sentences[/bold]  : {sentence_count} per word")
+    console.print(f"[bold]Deck[/bold]       : {deck_name}")
+    console.print(f"[bold]Audio[/bold]      : {'off' if no_audio else 'kokoro-onnx'}")
+    console.print(f"[bold]Cards[/bold]      : {'pronunciation' if pronunciation_cards else 'reading'}")
+    console.print(f"[bold]Output[/bold]     : {output_path}")
+    console.print()
 
 
-def _init(args: argparse.Namespace, parser: argparse.ArgumentParser) -> tuple[genai.Client, list[str], str, str]:
-    api_key = args.gemini_api_key or os.environ.get("GEMINI_API_KEY", "")
-    if not api_key:
-        parser.error("Gemini API key required: --gemini-api-key or GEMINI_API_KEY env var")
-
-    client = genai.Client(api_key=api_key)
-
-    if not args.no_audio:
-        _load_audio_deps()
-
-    if args.words:
-        words = [w.strip() for w in args.words.split(",") if w.strip()]
-    else:
-        with open(args.words_file, encoding="utf-8") as fh:
-            words = [line.strip() for line in fh if line.strip()]
-
-    if not words:
-        parser.error("No words found")
-
-    deck_name = args.deck_name or (
-        f"Kotoba::{args.language.capitalize()}"
-        + (f"::{args.topic.capitalize()}" if args.topic else "")
-    )
-    output_path = args.output or f"{args.language}_anki.apkg"
-
-    return client, words, deck_name, output_path
-
-
-def _print_params(args: argparse.Namespace, words: list[str], deck_name: str, output_path: str) -> None:
-    print(f"Language   : {args.language}")
-    print(f"Words      : {len(words)}  ({', '.join(words[:6])}{'...' if len(words) > 6 else ''})")
-    if args.proficiency:
-        print(f"Proficiency: {args.proficiency.upper()}")
-    if args.topic:
-        print(f"Topic      : {args.topic}")
-    print(f"Sentences  : {args.sentence_count} per word")
-    print(f"Deck       : {deck_name}")
-    print(f"Audio      : {'off' if args.no_audio else 'kokoro-onnx'}")
-    print(f"Cards      : {'pronunciation' if args.pronunciation_cards else 'reading'}")
-    print(f"Output     : {output_path}")
-    print()
-
-
-def _generate_sentences(args: argparse.Namespace, words: list[str], client: genai.Client) -> list[dict]:
-    print("── Generating sentences ────────────────────────────────────────")
+def _generate_sentences(
+    words: list[str],
+    language: str,
+    proficiency: Optional[Proficiency],
+    topic: Optional[str],
+    sentence_count: int,
+    client: genai.Client,
+) -> list[dict]:
+    console.rule("[bold]Generating sentences[/bold]")
     words_data: list[dict] = []
 
     for word in words:
-        print(f"  {word}...", end=" ", flush=True)
+        console.print(f"  {word}...", end=" ")
         try:
             data = fetch_word_data(
                 word=word,
-                language=args.language,
-                proficiency=args.proficiency,
-                topic=args.topic,
-                sentence_count=args.sentence_count,
+                language=language,
+                proficiency=proficiency,
+                topic=topic,
+                sentence_count=sentence_count,
                 client=client,
             )
             sentences = [
                 {"sentence": s.sentence, "translation": s.translation, "audio_bytes": None}
-                for s in data.sentences[: args.sentence_count]
+                for s in data.sentences[:sentence_count]
             ]
             words_data.append({
                 "word": word,
                 "word_translation": data.word_translation,
                 "sentences": sentences,
             })
-            print(f'→ "{data.word_translation}" ({len(sentences)} sentences)')
+            console.print(f'[green]→ "{data.word_translation}"[/green] ({len(sentences)} sentences)')
         except Exception as exc:
-            print(f"FAILED: {exc}", file=sys.stderr)
-            print(f"  skipping '{word}'")
+            err_console.print(f"[red]FAILED:[/red] {exc}")
+            console.print(f"  [yellow]skipping '{word}'[/yellow]")
 
     if not words_data:
-        sys.exit("No words processed.")
+        err_console.print("[red]No words processed.[/red]")
+        raise typer.Exit(1)
 
     return words_data
 
 
 def _generate_audio(words_data: list[dict], language: str) -> None:
     total = sum(len(w["sentences"]) for w in words_data)
-    print(f"\n── Generating audio ({total} sentences via kokoro-onnx) ─────────")
+    console.rule(f"[bold]Generating audio[/bold] ({total} sentences via kokoro-onnx)")
 
     all_sents = [sent for word_info in words_data for sent in word_info["sentences"]]
     ok = 0
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {
-            pool.submit(generate_audio, sent["sentence"], language): sent
-            for sent in all_sents
-        }
-        for future in as_completed(futures):
-            sent = futures[future]
-            try:
-                sent["audio_bytes"] = future.result()
-                ok += 1
-                print(".", end="", flush=True)
-            except Exception as exc:
-                print(f"\n  Warning: audio failed for '{sent['sentence'][:40]}': {exc}",
-                      file=sys.stderr)
-    print(f"\n  {ok}/{total} audio files generated")
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        console=console,
+    ) as progress:
+        task = progress.add_task("Synthesising...", total=total)
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(generate_audio, sent["sentence"], language): sent
+                for sent in all_sents
+            }
+            for future in as_completed(futures):
+                sent = futures[future]
+                try:
+                    sent["audio_bytes"] = future.result()
+                    ok += 1
+                except Exception as exc:
+                    err_console.print(f"[yellow]Warning: audio failed for '{sent['sentence'][:40]}': {exc}[/yellow]")
+                finally:
+                    progress.advance(task)
+
+    console.print(f"  {ok}/{total} audio files generated")
 
 
-def main() -> None:
-    parser = _build_parser()
-    args = parser.parse_args()
+@app.command()
+def main(
+    language: str = typer.Option(..., help="Target language, e.g. spanish, japanese, italian"),
+    words: Optional[str] = typer.Option(None, metavar="WORD,WORD,...", help="Comma-separated list of words"),
+    words_file: Optional[Path] = typer.Option(None, metavar="FILE", help="One word per line"),
+    proficiency: Optional[Proficiency] = typer.Option(None, help="Learner proficiency level (recommended)"),
+    topic: Optional[str] = typer.Option(None, help="Topic context for sentence generation"),
+    sentence_count: int = typer.Option(2, min=1, max=5, help="Sentences per word, 1–5 (default: 2)"),
+    deck_name: Optional[str] = typer.Option(None, metavar="NAME", help="Anki deck name (default: Kotoba::<Language>[::<Topic>])"),
+    output: Optional[str] = typer.Option(None, metavar="FILE", help="Output .apkg path (default: <language>_anki.apkg)"),
+    gemini_api_key: Optional[str] = typer.Option(None, metavar="KEY", envvar="GEMINI_API_KEY", help="Gemini API key (or set GEMINI_API_KEY env var)"),
+    no_audio: bool = typer.Option(False, "--no-audio/--audio", help="Skip audio generation; text-only cards"),
+    pronunciation_cards: bool = typer.Option(False, "--pronunciation-cards/--reading-cards", help="Generate pronunciation cards instead of reading cards"),
+) -> None:
+    if not words and not words_file:
+        err_console.print("[red]Provide --words or --words-file (exactly one required)[/red]")
+        raise typer.Exit(1)
+    if words and words_file:
+        err_console.print("[red]--words and --words-file are mutually exclusive[/red]")
+        raise typer.Exit(1)
 
-    client, words, deck_name, output_path = _init(args, parser)
-    _print_params(args, words, deck_name, output_path)
-    words_data = _generate_sentences(args, words, client)
+    if not gemini_api_key:
+        err_console.print("[red]Gemini API key required: --gemini-api-key or GEMINI_API_KEY env var[/red]")
+        raise typer.Exit(1)
 
-    if args.no_audio:
-        print("── Audio skipped ───────────────────────────────────────────────")
+    client = genai.Client(api_key=gemini_api_key)
+
+    if not no_audio:
+        _load_audio_deps()
+
+    if words:
+        word_list = [w.strip() for w in words.split(",") if w.strip()]
     else:
-        _generate_audio(words_data, args.language)
+        with open(words_file, encoding="utf-8") as fh:
+            word_list = [line.strip() for line in fh if line.strip()]
 
-    print(f"\n── Writing {output_path} ──────────────────────────────────────────")
-    card_count = build_apkg(
-        words_data, deck_name, output_path,
-        language=args.language,
-        pronunciation_cards=args.pronunciation_cards,
+    if not word_list:
+        err_console.print("[red]No words found[/red]")
+        raise typer.Exit(1)
+
+    final_deck_name = deck_name or (
+        f"Kotoba::{language.capitalize()}"
+        + (f"::{topic.capitalize()}" if topic else "")
     )
-    print(f"Done — {card_count} cards → {output_path}")
+    output_path = output or f"{language}_anki.apkg"
+
+    _print_params(language, word_list, proficiency, topic, sentence_count, final_deck_name, output_path, no_audio, pronunciation_cards)
+    words_data = _generate_sentences(word_list, language, proficiency, topic, sentence_count, client)
+
+    if no_audio:
+        console.rule("[bold]Audio skipped[/bold]")
+    else:
+        _generate_audio(words_data, language)
+
+    console.rule(f"[bold]Writing {output_path}[/bold]")
+    card_count = build_apkg(
+        words_data, final_deck_name, output_path,
+        language=language,
+        pronunciation_cards=pronunciation_cards,
+    )
+    console.print(f"\n[green bold]Done[/green bold] — {card_count} cards → {output_path}")
 
 
 if __name__ == "__main__":
-    main()
+    app()
