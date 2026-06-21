@@ -1,0 +1,18 @@
+<script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
+<div id="kotoba-sentence" class="sentence"></div>
+<button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
+<hr id=answer>
+<div id="kotoba-translation" class="translation"></div>
+{{#Word}}<div class="word">{{Word}}</div>{{/Word}}
+<script>
+(function () {
+  var items = JSON.parse(document.getElementById('kotoba-data').textContent);
+  var idx = parseInt(sessionStorage.getItem('kotobaIdx') || '0', 10);
+  if (idx < 0 || idx >= items.length) idx = 0;
+  document.getElementById('kotoba-sentence').innerHTML = items[idx].s;
+  document.getElementById('kotoba-translation').textContent = items[idx].t;
+  if (items[idx].a) {
+    window._kotobaReplay = function () { new Audio(items[idx].a).play(); };
+  }
+}());
+</script>

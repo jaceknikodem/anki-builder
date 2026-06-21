@@ -1,0 +1,21 @@
+.card {
+  font-family: -apple-system, "Helvetica Neue", Arial, sans-serif;
+  font-size: 20px;
+  text-align: center;
+  color: #1c1c1e;
+  background: #ffffff;
+}
+.sentence { font-size: 26px; margin: 16px 0; line-height: 1.6; }
+.sentence .kw { color: #2563eb; font-weight: 700; }
+.translation { margin-top: 12px; color: #444; }
+.word { color: #888; font-size: 16px; margin-top: 14px; font-style: italic; }
+hr#answer { margin: 18px 0; border: none; border-top: 1px solid #e0e0e0; }
+ruby { ruby-align: center; }
+rt { font-size: 0.5em; color: #555; }
+.kotoba-replay {
+  background: none; border: 2px solid #2563eb; border-radius: 50%;
+  color: #2563eb; cursor: pointer; font-size: 22px;
+  width: 52px; height: 52px; margin-top: 8px;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.kotoba-replay:hover { background: #eff6ff; }

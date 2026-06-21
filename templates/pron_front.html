@@ -1,0 +1,16 @@
+<script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
+<div class="pron-label">Listen, then show answer to speak:</div>
+<div id="kotoba-sentence" class="sentence"></div>
+<button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
+{{type:SentencePlain}}
+<script>
+(function () {
+  var items = JSON.parse(document.getElementById('kotoba-data').textContent);
+  document.getElementById('kotoba-sentence').innerHTML = items[0].s;
+  if (items[0].a) {
+    var _audio = new Audio(items[0].a);
+    _audio.play();
+    window._kotobaReplay = function () { _audio.currentTime = 0; _audio.play(); };
+  }
+}());
+</script>

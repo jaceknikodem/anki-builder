@@ -1,0 +1,102 @@
+<script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
+<div id="kotoba-sentence" class="sentence"></div>
+<button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
+{{type:SentencePlain}}
+<hr id=answer>
+<div id="score-box" class="score-box"></div>
+<div id="score-verdict" class="score-verdict"></div>
+<div id="you-said" class="you-said"></div>
+<div id="kotoba-translation" class="translation"></div>
+{{#Word}}<div class="word">{{Word}}</div>{{/Word}}
+<script>
+(function () {
+  function lev(a, b) {
+    var m = a.length, n = b.length, i, j;
+    var dp = [];
+    for (i = 0; i <= m; i++) { dp[i] = [i]; }
+    for (j = 1; j <= n; j++) { dp[0][j] = j; }
+    for (i = 1; i <= m; i++) {
+      for (j = 1; j <= n; j++) {
+        dp[i][j] = a[i-1] === b[j-1] ? dp[i-1][j-1]
+          : 1 + Math.min(dp[i-1][j], dp[i][j-1], dp[i-1][j-1]);
+      }
+    }
+    return dp[m][n];
+  }
+  function sim(a, b) {
+    if (!a && !b) return 1;
+    if (!a || !b) return 0;
+    return 1 - lev(a, b) / Math.max(a.length, b.length);
+  }
+  function norm(s) {
+    return s.trim().replace(/[ァ-ヶ]/g, function (c) {
+      return String.fromCharCode(c.charCodeAt(0) - 0x60);
+    });
+  }
+  function esc(s) {
+    return s.replace(/[<>&"]/g, function (c) {
+      return {'<':'&lt;','>':'&gt;','&':'&amp;','"':'&quot;'}[c];
+    });
+  }
+  var item = JSON.parse(document.getElementById('kotoba-data').textContent)[0];
+  document.getElementById('kotoba-sentence').innerHTML = item.s;
+  document.getElementById('kotoba-translation').textContent = item.t;
+  if (item.a) {
+    window._kotobaReplay = function () { new Audio(item.a).play(); };
+  }
+  function extractTyped() {
+    var typeans = document.getElementById('typeans');
+    if (!typeans) return '';
+    // Anki marks user's chars as typeGood (correct) or typeBad (wrong); typeMissed = not typed.
+    var spans = typeans.querySelectorAll('.typeGood, .typeBad');
+    if (spans.length > 0) {
+      var t = ''; spans.forEach(function (el) { t += el.textContent; }); return t;
+    }
+    // Fallback: full text minus missed chars (different Anki versions).
+    var clone = typeans.cloneNode(true);
+    clone.querySelectorAll('.typeMissed').forEach(function (el) { el.remove(); });
+    return clone.textContent.trim();
+  }
+  function showScore() {
+    var userRaw  = extractTyped();
+    var userNorm = norm(userRaw);
+    var score = Math.max(
+      sim(userNorm, norm(item.p || '')),
+      item.h ? sim(userNorm, norm(item.h)) : 0
+    );
+    var pct = Math.round(score * 100);
+    var box     = document.getElementById('score-box');
+    var verdict = document.getElementById('score-verdict');
+    box.textContent = pct + '%';
+    if (pct >= 85) {
+      box.className = 'score-box score-excellent';
+      verdict.textContent = 'Excellent!';
+    } else if (pct >= 60) {
+      box.className = 'score-box score-ok';
+      verdict.textContent = 'Almost there';
+    } else {
+      box.className = 'score-box score-poor';
+      verdict.textContent = 'Keep practising';
+    }
+    document.getElementById('you-said').innerHTML =
+      userRaw ? 'You said: <em>' + esc(userRaw) + '</em>' : '<em>(nothing recorded)</em>';
+  }
+  // #typeans is populated asynchronously by Anki after the template renders.
+  var typeans = document.getElementById('typeans');
+  if (typeans && typeans.children.length > 0) {
+    showScore();
+  } else {
+    new MutationObserver(function (mutations, obs) {
+      var ta = document.getElementById('typeans');
+      if (ta && (ta.children.length > 0 || ta.textContent.trim())) {
+        obs.disconnect();
+        showScore();
+      }
+    }).observe(document.body, { childList: true, subtree: true });
+  }
+  // Fallback: if observer never fires (e.g. user typed nothing), show after 1.5 s.
+  setTimeout(function () {
+    if (!document.getElementById('score-box').textContent) showScore();
+  }, 1500);
+}());
+</script>
