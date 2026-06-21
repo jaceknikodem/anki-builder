@@ -515,6 +515,7 @@ _PRON_BACK_TMPL = """\
 <script type="application/json" id="kotoba-data">{{SentencesJSON}}</script>
 <div id="kotoba-sentence" class="sentence"></div>
 <button class="kotoba-replay" onclick="window._kotobaReplay&&window._kotobaReplay()">&#9654;</button>
+{{type:SentencePlain}}
 <hr id=answer>
 <div id="score-box" class="score-box"></div>
 <div id="score-verdict" class="score-verdict"></div>
