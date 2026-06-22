@@ -43,6 +43,7 @@ def _print_params(
     topic: Optional[str],
     sentence_count: int,
     deck_name: str,
+    model: str,
     output_path: str,
     no_audio: bool,
     pronunciation_cards: bool,
@@ -55,6 +56,7 @@ def _print_params(
         console.print(f"[bold]Topic[/bold]      : {topic}")
     console.print(f"[bold]Sentences[/bold]  : {sentence_count} per word")
     console.print(f"[bold]Deck[/bold]       : {deck_name}")
+    console.print(f"[bold]Model[/bold]      : {model}")
     console.print(f"[bold]Audio[/bold]      : {'off' if no_audio else 'kokoro-onnx'}")
     console.print(f"[bold]Cards[/bold]      : {'pronunciation' if pronunciation_cards else 'reading'}")
     console.print(f"[bold]Output[/bold]     : {output_path}")
@@ -68,6 +70,7 @@ def _generate_sentences(
     topic: Optional[str],
     sentence_count: int,
     client: genai.Client,
+    model: str,
 ) -> list[dict]:
     console.rule("[bold]Generating sentences[/bold]")
     words_data: list[dict] = []
@@ -82,6 +85,7 @@ def _generate_sentences(
                 topic=topic,
                 sentence_count=sentence_count,
                 client=client,
+                model=model,
             )
             sentences = [
                 {"sentence": s.sentence, "translation": s.translation, "audio_bytes": None}
@@ -147,6 +151,7 @@ def main(
     deck_name: Optional[str] = typer.Option(None, metavar="NAME", help="Anki deck name (default: Kotoba::<Language>[::<Topic>])"),
     output: Optional[str] = typer.Option(None, metavar="FILE", help="Output .apkg path (default: <language>_anki.apkg)"),
     gemini_api_key: Optional[str] = typer.Option(None, metavar="KEY", envvar="GEMINI_API_KEY", help="Gemini API key (or set GEMINI_API_KEY env var)"),
+    gemini_model: str = typer.Option("gemini-3.1-flash-lite", "--model", metavar="MODEL", help="Gemini model to use for sentence generation"),
     no_audio: bool = typer.Option(False, "--no-audio/--audio", help="Skip audio generation; text-only cards"),
     pronunciation_cards: bool = typer.Option(False, "--pronunciation-cards/--reading-cards", help="Generate pronunciation cards instead of reading cards"),
 ) -> None:
@@ -182,8 +187,8 @@ def main(
     )
     output_path = output or f"{language}_anki.apkg"
 
-    _print_params(language, word_list, proficiency, topic, sentence_count, final_deck_name, output_path, no_audio, pronunciation_cards)
-    words_data = _generate_sentences(word_list, language, proficiency, topic, sentence_count, client)
+    _print_params(language, word_list, proficiency, topic, sentence_count, final_deck_name, gemini_model, output_path, no_audio, pronunciation_cards)
+    words_data = _generate_sentences(word_list, language, proficiency, topic, sentence_count, client, gemini_model)
 
     if no_audio:
         console.rule("[bold]Audio skipped[/bold]")

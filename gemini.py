@@ -46,6 +46,7 @@ def fetch_word_data(
     topic: Optional[str],
     sentence_count: int,
     client: genai.Client,
+    model: str = "gemini-3.1-flash-lite",
 ) -> WordData:
     """
     Calls Gemini with structured output to get word translation + example sentences.
@@ -71,7 +72,7 @@ def fetch_word_data(
     for attempt in range(3):
         try:
             response = client.models.generate_content(
-                model="gemini-2.5-flash",
+                model=model,
                 contents=prompt,
                 config=genai_types.GenerateContentConfig(
                     response_mime_type="application/json",
