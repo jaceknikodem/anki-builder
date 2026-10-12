@@ -7,12 +7,19 @@ import os
 import random
 import shutil
 import tempfile
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import Iterator, Optional
 
 import genanki
 
-from japanese import furigana_highlight_html, highlight_word, sentence_to_hiragana
+from japanese import (
+    furigana_highlight_html,
+    furigana_html,
+    highlight_word,
+    sentence_to_hiragana,
+    sentence_to_romaji,
+)
 
 _TMPL_DIR = Path(__file__).parent / "templates"
 
@@ -69,8 +76,59 @@ PRONUNCIATION_MODEL = genanki.Model(
 )
 
 
+# Phrase cards: one personal sentence per note. The front is a cue (the English
+# meaning); the back reveals the Japanese with ruby, romaji and audio. Templates are
+# static — no JS — because there is exactly one sentence per note.
+PHRASE_MODEL = genanki.Model(
+    1758600000010,
+    "Kotoba Phrase v1",
+    fields=[
+        {"name": "Japanese"},  # HTML with <ruby> furigana
+        {"name": "Romaji"},
+        {"name": "English"},
+        {"name": "Audio"},     # [sound:...]; played automatically on the back
+    ],
+    templates=[{
+        "name": "Phrase",
+        "qfmt": _tmpl("phrase_front.html"),
+        "afmt": _tmpl("phrase_back.html"),
+    }],
+    css=_MODEL_CSS + _tmpl("phrase_extra.css"),
+)
+
+
 def _deck_id(name: str) -> int:
     return int.from_bytes(hashlib.sha256(name.encode()).digest()[:4], "big") & 0x7FFF_FFFF
+
+
+@contextmanager
+def _media_workspace() -> Iterator[tuple[str, list[str]]]:
+    """Yield (tmp_dir, media_paths); tmp_dir is removed on exit, so write the package inside the block."""
+    tmp_dir = tempfile.mkdtemp(prefix="kotoba-anki-")
+    try:
+        yield tmp_dir, []
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _save_package(deck: genanki.Deck, media_paths: list[str], output_path: str) -> None:
+    pkg = genanki.Package(deck)
+    pkg.media_files = media_paths
+    pkg.write_to_file(output_path)
+
+
+def _write_audio(sent: dict, tmp_dir: str, media_paths: list[str]) -> str:
+    """Write a sentence's audio to tmp_dir, register it as media, return its filename ("" if none)."""
+    audio_bytes: Optional[bytes] = sent.get("audio_bytes")
+    if not audio_bytes:
+        return ""
+    slug = hashlib.md5(sent["sentence"].encode()).hexdigest()[:10]
+    filename = f"kotoba_{slug}.wav"
+    tmp_path = os.path.join(tmp_dir, filename)
+    with open(tmp_path, "wb") as fh:
+        fh.write(audio_bytes)
+    media_paths.append(tmp_path)
+    return filename
 
 
 def _build_sentence_items(
@@ -84,16 +142,7 @@ def _build_sentence_items(
     audio_queue: list[str] = []
 
     for sent in word_info["sentences"]:
-        audio_filename = ""
-        audio_bytes: Optional[bytes] = sent.get("audio_bytes")
-        if audio_bytes:
-            slug = hashlib.md5(sent["sentence"].encode()).hexdigest()[:10]
-            filename = f"kotoba_{slug}.wav"
-            tmp_path = os.path.join(tmp_dir, filename)
-            with open(tmp_path, "wb") as fh:
-                fh.write(audio_bytes)
-            media_paths.append(tmp_path)
-            audio_filename = filename
+        audio_filename = _write_audio(sent, tmp_dir, media_paths)
 
         sentence_html = (
             furigana_highlight_html(sent["sentence"], word)
@@ -130,11 +179,9 @@ def build_apkg(
     Returns card count.
     """
     deck = genanki.Deck(_deck_id(deck_name), deck_name)
-    tmp_dir = tempfile.mkdtemp(prefix="kotoba-anki-")
-    media_paths: list[str] = []
     is_japanese = language.lower() == "japanese"
 
-    try:
+    with _media_workspace() as (tmp_dir, media_paths):
         shuffled = list(words_data)
         random.shuffle(shuffled)
 
@@ -164,10 +211,34 @@ def build_apkg(
                 )
                 deck.add_note(pron_note)
 
-        pkg = genanki.Package(deck)
-        pkg.media_files = media_paths
-        pkg.write_to_file(output_path)
-    finally:
-        shutil.rmtree(tmp_dir, ignore_errors=True)
+        _save_package(deck, media_paths, output_path)
+
+    return len(deck.notes)
+
+
+def build_phrase_apkg(sentences: list[dict], deck_name: str, output_path: str) -> int:
+    """
+    Build an .apkg of phrase cards. Each entry in `sentences`:
+        {sentence, translation, audio_bytes?}
+    Order is preserved so thematically grouped lists are introduced in that order.
+    Requires japanese.init_tagger() for ruby and romaji. Returns card count.
+    """
+    deck = genanki.Deck(_deck_id(deck_name), deck_name)
+
+    with _media_workspace() as (tmp_dir, media_paths):
+        for sent in sentences:
+            audio_filename = _write_audio(sent, tmp_dir, media_paths)
+            deck.add_note(genanki.Note(
+                model=PHRASE_MODEL,
+                fields=[
+                    furigana_html(sent["sentence"]),
+                    html.escape(sentence_to_romaji(sent["sentence"])),
+                    html.escape(sent["translation"]),
+                    f"[sound:{audio_filename}]" if audio_filename else "",
+                ],
+                guid=genanki.guid_for("kotoba-phrase-v1", sent["sentence"]),
+            ))
+
+        _save_package(deck, media_paths, output_path)
 
     return len(deck.notes)
